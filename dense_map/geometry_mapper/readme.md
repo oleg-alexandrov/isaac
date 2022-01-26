@@ -1754,11 +1754,22 @@ This program's options are:
       when intersecting the ray with a mesh, in meters (if
       applicable).
 
+    --no_extrinsics
+      Do not model the extrinsics between cameras. Hence the pose of any 
+      camera of any type may vary on its own with no restriction that the cameras 
+      be on a rig. Model however depth_to_image_transform. See also 
+      --float_nonref_cameras.
+
+   --float_nonref_cameras
+      To use in conjunction with --no_extrinsics to float
+      non-reference camera poses. Use --float_sparse map to float the
+      reference cameras.
+
     --nav_cam_distortion_replacement (string, default = "")
       Replace nav_cam's distortion coefficients with this list after
       the initial determination of triangulated points, and then
-      continue with distortion optimization. A quoted list of four or
-      five values expected, separated by spaces, as the replacement
+      continue with distortion optimization. A quoted list of five
+      values is expected, separated by spaces, as the replacement
       distortion model will have radial and tangential
       coefficients. Set a positive
       --nav_cam_num_exclude_boundary_pixels.
@@ -1806,15 +1817,16 @@ the refiner has the option of computing such a model which best fits
 the given fisheye model. For that, the refiner is started with the
 fisheye model, this model is used to set up the problem, including
 triangulating the 3D points after feature detection, then the fisheye
-model is replaced on-the-fly with desired 4 or 5 coefficients of the
-radtan model via the option --nav_cam_distortion_replacement, to which
-one can pass, for example, "0 0 0 0". These coefficients will then be
-optimized while keeping the rest of the variables fixed (nav cam focal
-length and optical center, intrinsics of other cameras, and all the
-extrinsics). The new best-fit distortion model will be written to disk
-at the end, replacing the fisheye model, and from then on the new
-model can be used for further calibration experiments just as with the
-fisheye model.
+model is replaced on-the-fly with desired 5 coefficients of the radtan
+model via the option --nav_cam_distortion_replacement, to which one
+can pass, for example, "0 0 0 0 0" (in principle 4 values could be
+tried, but that was resulting in a very poor fit). These coefficients
+will then be optimized while keeping the rest of the variables fixed
+(nav cam focal length and optical center, intrinsics of other cameras,
+and all the extrinsics). The new best-fit distortion model will be
+written to disk at the end, replacing the fisheye model, and from then
+on the new model can be used for further calibration experiments just
+as with the fisheye model.
 
 It may however be needed to rerun the refiner one more time, this time
 with the new distortion model read from disk, and still keep all

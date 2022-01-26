@@ -30,9 +30,7 @@
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic push
 #include <openMVG/multiview/projection.hpp>
-#include <openMVG/multiview/rotation_averaging_l1.hpp>
 #include <openMVG/multiview/triangulation_nview.hpp>
-#include <openMVG/numeric/numeric.h>
 #include <openMVG/tracks/tracks.hpp>
 #pragma GCC diagnostic pop
 
