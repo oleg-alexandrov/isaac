@@ -721,16 +721,15 @@ struct XYZError {
   double m_weight;
 };  // End class XYZError
 
-// Calculate the rmse residual for each residual type.
-void calc_median_residuals(std::vector<double> const& residuals,
-                           std::vector<std::string> const& residual_names,
-                           std::string const& tag) {
+void calc_residuals_stats(std::vector<double> const& residuals,
+                          std::vector<std::string> const& residual_names,
+                          std::string const& tag) {
   size_t num = residuals.size();
 
   if (num != residual_names.size())
     LOG(FATAL) << "There must be as many residuals as residual names.";
 
-  std::map<std::string, std::vector<double> > stats;
+  std::map<std::string, std::vector<double>> stats;
   for (size_t it = 0; it < residuals.size(); it++)
     stats[residual_names[it]] = std::vector<double>();  // initialize
 
@@ -966,10 +965,9 @@ void calc_world_to_cam_no_extrinsics(  // Inputs
 // Use one of the two implementations above. Care is needed as when there are no extrinsics,
 // each camera is on its own, so the input is in world_to_cam_vec and not in world_to_ref_vec
 void calc_world_to_cam_transforms(  // Inputs
-  bool no_extrinsics, std::vector<dense_map::cameraImage> const& cams,
-  std::vector<double> const& world_to_ref_vec, std::vector<double> const& ref_timestamps,
-  std::vector<double> const& ref_to_cam_vec, std::vector<double> const& world_to_cam_vec,
-  std::vector<double> const& ref_to_cam_timestamp_offsets,
+  bool no_extrinsics, std::vector<dense_map::cameraImage> const& cams, std::vector<double> const& world_to_ref_vec,
+  std::vector<double> const& ref_timestamps, std::vector<double> const& ref_to_cam_vec,
+  std::vector<double> const& world_to_cam_vec, std::vector<double> const& ref_to_cam_timestamp_offsets,
   // Output
   std::vector<Eigen::Affine3d>& world_to_cam) {
   if (!no_extrinsics)
@@ -1644,7 +1642,7 @@ void evalResiduals(  // Inputs
   for (size_t it = 0; it < residuals.size(); it++)
     residuals[it] /= residual_scales[it];
 
-  dense_map::calc_median_residuals(residuals, residual_names, tag);
+  dense_map::calc_residuals_stats(residuals, residual_names, tag);
   return;
 }
 
