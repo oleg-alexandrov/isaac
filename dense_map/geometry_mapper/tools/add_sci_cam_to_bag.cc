@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
   }
 
   // Make the directory where the output will go
+  // TODO(oalexan1): Use the function dense_map::createDir(). Test that it works.
   std::string out_dir = boost::filesystem::path(FLAGS_output_bag).parent_path().string();
   if (out_dir == "") out_dir = ".";
   if (!boost::filesystem::exists(out_dir)) {

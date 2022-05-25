@@ -23,6 +23,7 @@
 #include <msg_conversions/msg_conversions.h>
 
 #include <dense_map_utils.h>
+#include <camera_image.h>
 
 #include <boost/filesystem.hpp>
 
@@ -517,10 +518,13 @@ double fileNameToTimestamp(std::string const& file_name) {
   return atof(frameStr.c_str());
 }
 
-// Create a directory unless it exists already
+// Create a directory recursively, unless it exists already. This works like mkdir -p.
 void createDir(std::string const& dir) {
-  if (!boost::filesystem::create_directories(dir) && !boost::filesystem::is_directory(dir)) {
-    LOG(FATAL) << "Failed to create directory: " << dir << "\n";
+  if (dir == "") return;  // This can be useful if dir was created with parent_path().
+
+  if (!boost::filesystem::exists(dir)) {
+    if (!boost::filesystem::create_directories(dir) || !boost::filesystem::is_directory(dir))
+      LOG(FATAL) << "Failed to create directory: " << dir << "\n";
   }
 }
 
@@ -911,7 +915,8 @@ void scaleImage(double max_iso_times_exposure, double iso, double exposure, cv::
 // them. Assume that the input timestamps are sorted in increasing order.
 // TODO(oalexan1): May have to add a constraint to only pick
 // a timestamp if not further from the bound than a given value.
-void pickTimestampsInBounds(std::vector<double> const& timestamps, double left_bound, double right_bound, double offset,
+void pickTimestampsInBounds(std::vector<double> const& timestamps,
+                            double left_bound, double right_bound, double offset,
                             std::vector<double>& out_timestamps) {
   out_timestamps.clear();
 
@@ -946,12 +951,14 @@ void pickTimestampsInBounds(std::vector<double> const& timestamps, double left_b
 
 // A debug utility for saving a camera in a format ASP understands.
 // Need to expose the sci cam intrinsics.
-void save_tsai_camera(Eigen::MatrixXd const& desired_cam_to_world_trans, std::string const& output_dir,
+void saveTsaiCamera(Eigen::MatrixXd const& desired_cam_to_world_trans,
+                        std::string const& output_dir,
                       double curr_time, std::string const& suffix) {
   char filename_buffer[1000];
   auto T = desired_cam_to_world_trans;
   double shift = 6378137.0;  // planet radius, pretend this is a satellite camera
-  snprintf(filename_buffer, sizeof(filename_buffer), "%s/%10.7f_%s.tsai", output_dir.c_str(), curr_time,
+  snprintf(filename_buffer, sizeof(filename_buffer), "%s/%10.7f_%s.tsai",
+           output_dir.c_str(), curr_time,
            suffix.c_str());
   std::cout << "Writing: " << filename_buffer << std::endl;
   std::ofstream ofs(filename_buffer);
@@ -970,6 +977,120 @@ void save_tsai_camera(Eigen::MatrixXd const& desired_cam_to_world_trans, std::st
   ofs << "pitch = 1\n";
   ofs << "NULL\n";
   ofs.close();
+}
+
+// Write an image with 3 floats per pixel. OpenCV's imwrite() cannot do that.
+void saveXyzImage(std::string const& filename, cv::Mat const& img) {
+  if (img.depth() != CV_32F)
+    LOG(FATAL) << "Expecting an image with float values\n";
+  if (img.channels() != 3) LOG(FATAL) << "Expecting 3 channels.\n";
+
+  std::ofstream f;
+  f.open(filename.c_str(), std::ios::binary | std::ios::out);
+  if (!f.is_open()) LOG(FATAL) << "Cannot open file for writing: " << filename << "\n";
+
+  // Assign these to explicit variables so we know their type and size in bytes
+  int rows = img.rows, cols = img.cols, channels = img.channels();
+
+  // TODO(oalexan1): Avoid C-style cast. Test if
+  // reinterpret_cast<char*> does the same thing.
+  f.write((char*)(&rows), sizeof(rows));         // NOLINT
+  f.write((char*)(&cols), sizeof(cols));         // NOLINT
+  f.write((char*)(&channels), sizeof(channels)); // NOLINT
+
+  for (int row = 0; row < rows; row++) {
+    for (int col = 0; col < cols; col++) {
+      cv::Vec3f const& P = img.at<cv::Vec3f>(row, col);  // alias
+      // TODO(oalexan1): See if using reinterpret_cast<char*> does the same
+      // thing.
+      for (int c = 0; c < channels; c++)
+        f.write((char*)(&P[c]), sizeof(P[c])); // NOLINT
+    }
+  }
+
+  return;
+}
+
+// Read an image with 3 floats per pixel. OpenCV's imread() cannot do that.
+void readXyzImage(std::string const& filename, cv::Mat & img) {
+  std::ifstream f;
+  f.open(filename.c_str(), std::ios::binary | std::ios::in);
+  if (!f.is_open()) LOG(FATAL) << "Cannot open file for reading: " << filename << "\n";
+
+  int rows, cols, channels;
+  f.read((char*)(&rows), sizeof(rows));         // NOLINT
+  f.read((char*)(&cols), sizeof(cols));         // NOLINT
+  f.read((char*)(&channels), sizeof(channels)); // NOLINT
+
+  img = cv::Mat::zeros(rows, cols, CV_32FC3);
+
+  for (int row = 0; row < rows; row++) {
+    for (int col = 0; col < cols; col++) {
+      cv::Vec3f P;
+      // TODO(oalexan1): See if using reinterpret_cast<char*> does the same
+      // thing.
+      for (int c = 0; c < channels; c++)
+        f.read((char*)(&P[c]), sizeof(P[c])); // NOLINT
+      img.at<cv::Vec3f>(row, col) = P;
+    }
+  }
+
+  return;
+}
+
+// Create the image and depth cloud file names
+void genImageAndDepthFileNames(  // Inputs
+  std::vector<dense_map::cameraImage> const& cams, std::vector<std::string> const& cam_names,
+  std::string const& out_dir,
+  // Outputs
+  std::vector<std::string>& image_files, std::vector<std::string>& depth_files) {
+  // Wipe the output
+  image_files.clear();
+
+  char buffer[1000];
+  for (size_t it = 0; it < cams.size(); it++) {
+    // Use the timestamp as image name. We use this convention in many places,
+    // and will later look up the timestamp from image name.
+    // Note that several sensors can produce images with same timestamp,
+    // so also keep track of camera name.
+    std::string cam_dir = out_dir + "/" + cam_names[cams[it].camera_type];
+    snprintf(buffer, sizeof(buffer), "%s/%10.7f.jpg",
+             cam_dir.c_str(), cams[it].timestamp);
+    image_files.push_back(buffer);
+
+    std::string cloud_dir = cam_dir + "_depth";
+    snprintf(buffer, sizeof(buffer), "%s/%10.7f.pc",
+             cloud_dir.c_str(), cams[it].timestamp);
+    depth_files.push_back(buffer);
+  }
+}
+
+// Save images and depth clouds to disk
+void saveImagesAndDepthClouds(std::vector<dense_map::cameraImage> const& cams,
+                              std::vector<std::string> const& image_files,
+                              std::vector<std::string> const& depth_files) {
+  if (cams.size() != image_files.size())
+    LOG(FATAL) << "There must be as many image files as cameras.\n";
+
+  for (size_t it = 0; it < cams.size(); it++) {
+    // Create the directory for the image file
+    std::string out_dir = boost::filesystem::path(image_files[it]).parent_path().string();
+    if (out_dir != "") dense_map::createDir(out_dir);
+
+    std::cout << "Writing: " << image_files[it] << std::endl;
+    cv::imwrite(image_files[it], cams[it].image);
+
+    if (cams[it].depth_cloud.cols > 0 && cams[it].depth_cloud.rows > 0) {
+      // Create the directory for the depth cloud
+      out_dir = boost::filesystem::path(depth_files[it]).parent_path().string();
+      if (out_dir != "") dense_map::createDir(out_dir);
+
+      std::cout << "Writing: " << depth_files[it] << std::endl;
+      dense_map::saveXyzImage(depth_files[it], cams[it].depth_cloud);
+    }
+  }
+
+  return;
 }
 
 }  // end namespace dense_map

@@ -158,9 +158,18 @@ void detectFeatures(const cv::Mat& image, bool verbose,
 // This really likes haz cam first and nav cam second
 void matchFeatures(std::mutex* match_mutex, int left_image_index, int right_image_index,
                    cv::Mat const& left_descriptors, cv::Mat const& right_descriptors,
-                   Eigen::Matrix2Xd const& left_keypoints, Eigen::Matrix2Xd const& right_keypoints, bool verbose,
+                   Eigen::Matrix2Xd const& left_keypoints,
+                   Eigen::Matrix2Xd const& right_keypoints, bool verbose,
                    // Output
                    MATCH_PAIR* matches);
+
+// Form the match file name. Assume the input images are of the form
+// cam_name/image.jpg Keep the name of the cameras as part of the
+// match file name, to avoid the case when two different cameras have
+// images with the same name.
+std::string matchFileName(std::string const& match_dir,
+                          std::string const& left_image, std::string const& right_image,
+                          std::string const& suffix);
 
 // Routines for reading & writing interest point match files
 void writeMatchFile(std::string match_file, std::vector<InterestPoint> const& ip1,
@@ -184,15 +193,16 @@ struct cameraImage;
 
 void detectMatchFeatures(  // Inputs
                          std::vector<dense_map::cameraImage> const& cams,
-                         std::vector<std::string> const& cam_names,
                          std::vector<camera::CameraParameters> const& cam_params,
+                         std::vector<std::string> const& image_files,
+                         std::string const& out_dir,
+                         bool save_matches,
                          std::vector<Eigen::Affine3d> const& world_to_cam, int num_overlaps,
                          int initial_max_reprojection_error, int num_match_threads,
                          bool verbose,
                          // Outputs
                          std::vector<std::vector<std::pair<float, float>>>& keypoint_vec,
-                         std::vector<std::map<int, int>>& pid_to_cid_fid,
-                         std::vector<std::string> & image_files);
+                         std::vector<std::map<int, int>>& pid_to_cid_fid);
 
 }  // namespace dense_map
 

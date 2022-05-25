@@ -1799,7 +1799,20 @@ This program's options are:
       How many threads to use in feature detection/matching.
       A large number can use a lot of memory.
 
-    --verbose (bool, false unless specified)
+    --out_dir (string, default = "")
+      Save in this directory the camera intrinsics and extrinsics.
+      See also --save-images_and_depth_clouds, --save-matches,
+      --verbose, and --in_dir.
+
+   --save_images_and_depth_clouds (bool, false unless specified)
+     Save the images and point clouds used in processing. Implies that
+     --out_dir is set.
+
+   --save_matches (bool, false unless specified)
+     Save the interest point matches. Stereo Pipeline's viewer can be used for
+     visualizing these. Implies that -out_dir is set.
+
+   --verbose (bool, false unless specified)
       Print the residuals and save the images and match files. Stereo
       Pipeline's viewer can be used for visualizing these.
 

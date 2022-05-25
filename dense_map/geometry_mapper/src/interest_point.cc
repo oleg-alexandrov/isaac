@@ -23,6 +23,7 @@
 
 #include <interest_point.h>           // from the isaac repo
 #include <camera_image.h>             // from the isaac repo
+#include <dense_map_utils.h>
 #include <interest_point/matching.h>  // from the astrobee repo
 
 // Get rid of warnings beyond our control
@@ -323,6 +324,7 @@ void writeMatchFile(std::string match_file, std::vector<InterestPoint> const& ip
   f.close();
 }
 
+// TODO(oalexan1): This is old code which needs to be wiped
 void saveImagesAndMatches(std::string const& left_prefix, std::string const& right_prefix,
                           std::pair<int, int> const& index_pair, MATCH_PAIR const& match_pair,
                           std::vector<cv::Mat> const& images) {
@@ -399,34 +401,49 @@ Eigen::Vector3d Triangulate(std::vector<double>          const& focal_length_vec
   return solution;
 }
 
+// Form the match file name. Assume the input images are of the form
+// cam_name/image.jpg Keep the name of the cameras as part of the
+// match file name, to avoid the case when two different cameras have
+// images with the same name.
+std::string matchFileName(std::string const& match_dir,
+                          std::string const& left_image, std::string const& right_image,
+                          std::string const& suffix) {
+  // Keep the name of the cameras as part of the match file name,
+  // to avoid the case when two different cameras have
+  // images with the same name.
+  std::string left_cam_name
+    = boost::filesystem::path(left_image).parent_path().stem().string();
+  std::string right_cam_name
+    = boost::filesystem::path(right_image).parent_path().stem().string();
+
+  if (left_cam_name == "" || right_cam_name == "")
+    LOG(FATAL) << "The image name must have the form cam_name/image. Got: "
+               << left_image << " and " << right_image << ".\n";
+
+  std::string left_stem = boost::filesystem::path(left_image).stem().string();
+  std::string right_stem = boost::filesystem::path(right_image).stem().string();
+
+  std::string match_file = match_dir + "/" + left_cam_name + "-" + left_stem + "__"
+    + right_cam_name + "-" + right_stem + suffix + ".match";
+
+  return match_file;
+}
+
 void detectMatchFeatures(  // Inputs
                          std::vector<dense_map::cameraImage> const& cams,
-                         std::vector<std::string> const& cam_names,
                          std::vector<camera::CameraParameters> const& cam_params,
+                         std::vector<std::string> const& image_files,
+                         std::string const& out_dir,
+                         bool save_matches,
                          std::vector<Eigen::Affine3d> const& world_to_cam, int num_overlaps,
                          int initial_max_reprojection_error, int num_match_threads,
                          bool verbose,
                          // Outputs
                          std::vector<std::vector<std::pair<float, float>>>& keypoint_vec,
-                         std::vector<std::map<int, int>>& pid_to_cid_fid,
-                         std::vector<std::string> & image_files) {
+                         std::vector<std::map<int, int>>& pid_to_cid_fid) {
   // Wipe the outputs
   keypoint_vec.clear();
   pid_to_cid_fid.clear();
-  image_files.clear();
-
-  if (verbose) {
-    int count = 10000;
-    for (size_t it = 0; it < cams.size(); it++) {
-      std::ostringstream oss;
-      oss << count << "_" << cam_names[cams[it].camera_type] << ".jpg";
-      std::string name = oss.str();
-      std::cout << "Writing: " << name << std::endl;
-      cv::imwrite(name, cams[it].image);
-      count++;
-      image_files.push_back(name);
-    }
-  }
 
   // Detect features using multiple threads. Too many threads may result
   // in high memory usage.
@@ -449,8 +466,8 @@ void detectMatchFeatures(  // Inputs
     ff_common::ThreadPool thread_pool;
     for (size_t it = 0; it < cams.size(); it++) {
       thread_pool.AddTask
-        (&dense_map::detectFeatures,    // multi-thread  // NOLINT
-         // dense_map::detectFeatures(  // single-thread // NOLINT
+        (&dense_map::detectFeatures,    // multi-threaded  // NOLINT
+         // dense_map::detectFeatures(  // single-threaded // NOLINT
          cams[it].image, verbose, &cid_to_descriptor_map[it], &cid_to_keypoint_map[it]);
     }
     thread_pool.Join();
@@ -547,7 +564,15 @@ void detectMatchFeatures(  // Inputs
     match_map[index_pair] = mvg_matches;
   }
 
-  if (verbose) {
+  if (save_matches) {
+    if (out_dir.empty()) LOG(FATAL) << "Cannot save matches if no output directory was provided.\n";
+
+    if (image_files.size() != cams.size())
+      LOG(FATAL) << "Must have as many image files to save as cameras.\n";
+
+    std::string match_dir = out_dir + "/matches";
+    dense_map::createDir(match_dir);
+
     for (auto it = matches.begin(); it != matches.end(); it++) {
       std::pair<int, int> index_pair = it->first;
       dense_map::MATCH_PAIR const& match_pair = it->second;
@@ -558,13 +583,10 @@ void detectMatchFeatures(  // Inputs
       std::string left_image = image_files[left_index];
       std::string right_image = image_files[right_index];
 
-      std::string left_stem = boost::filesystem::path(left_image).stem().string();
-      std::string right_stem = boost::filesystem::path(right_image).stem().string();
+      std::string suffix = "";
+      std::string match_file = matchFileName(match_dir, left_image, right_image, suffix);
 
-      std::string match_file = left_stem + "__" + right_stem + ".match";
-
-      std::cout << "Writing: " << left_image << ' ' << right_image << ' '
-                << match_file << std::endl;
+      std::cout << "Writing: " << match_file << std::endl;
       dense_map::writeMatchFile(match_file, match_pair.first, match_pair.second);
     }
   }

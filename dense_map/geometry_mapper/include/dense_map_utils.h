@@ -170,7 +170,7 @@ void bestFitPlane(const std::vector<Eigen::Vector3d>& points, Eigen::Vector3d& c
 // Extract from a string of the form someDir/1234.5678.jpg the number 123.456.
 double fileNameToTimestamp(std::string const& file_name);
 
-// Create a directory unless it exists already
+// Create a directory recursively, unless it exists already. This works like mkdir -p.
 void createDir(std::string const& dir);
 
 // A little holding structure for nav, sci, and haz poses
@@ -210,7 +210,8 @@ void scaleImage(double max_iso_times_exposure, double iso, double exposure, cv::
 // them. Assume that the input timestamps are sorted in increasing order.
 // TODO(oalexan1): May have to add a constraint to only pick
 // a timestamp if not further from the bound than a given value.
-void pickTimestampsInBounds(std::vector<double> const& timestamps, double left_bound, double right_bound, double offset,
+void pickTimestampsInBounds(std::vector<double> const& timestamps, double left_bound,
+                            double right_bound, double offset,
                             std::vector<double>& out_timestamps);
 
 // Must always have NUM_EXIF the last.
@@ -219,9 +220,30 @@ enum ExifData { TIMESTAMP = 0, EXPOSURE_TIME, ISO, APERTURE, FOCAL_LENGTH, NUM_E
 // A utility for saving a camera in a format ASP understands.
 // TODO(oalexan1): Expose the sci cam intrinsics rather than having
 // them hard-coded.
-void save_tsai_camera(Eigen::MatrixXd const& desired_cam_to_world_trans,
+void saveTsaiCamera(Eigen::MatrixXd const& desired_cam_to_world_trans,
                       std::string const& output_dir,
                       double curr_time, std::string const& suffix);
+
+// Write an image with 3 floats per pixel. OpenCV's imwrite() cannot do that.
+void saveXyzImage(std::string const& filename, cv::Mat const& img);
+
+// Read an image with 3 floats per pixel. OpenCV's imread() cannot do that.
+void readXyzImage(std::string const& filename, cv::Mat & img);
+
+// Forward declaration
+struct cameraImage;
+
+// Create the image and depth cloud file names
+void genImageAndDepthFileNames(  // Inputs
+  std::vector<cameraImage> const& cams, std::vector<std::string> const& cam_names,
+  std::string const& out_dir,
+  // Outputs
+  std::vector<std::string>& image_files, std::vector<std::string>& depth_files);
+
+// Save images and depth clouds to disk
+void saveImagesAndDepthClouds(std::vector<cameraImage> const& cams,
+                              std::vector<std::string> const& image_files,
+                              std::vector<std::string> const& depth_files);
 
 }  // namespace dense_map
 

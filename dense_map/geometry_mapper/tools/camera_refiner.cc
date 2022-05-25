@@ -312,9 +312,19 @@ DEFINE_bool(float_nonref_cameras, false, "To use in conjunction with --no_extrin
             "to float non-reference camera poses. Use --float_sparse map to float the "
             "reference cameras.");
 
+DEFINE_string(out_dir, "",
+              "Save in this directory the camera intrinsics and extrinsics. "
+              "See also --save-images_and_depth_clouds, --save-matches, --verbose, and --in_dir.");
+
+DEFINE_bool(save_images_and_depth_clouds, false,
+            "Save the images and point clouds used in processing. Implies that --out_dir is set.");
+
+DEFINE_bool(save_matches, false,
+            "Save the interest point matches. Stereo Pipeline's viewer can be used for "
+            "visualizing these. Implies that --out_dir is set.");
+
 DEFINE_bool(verbose, false,
-            "Print the residuals and save the images and match files."
-            "Stereo Pipeline's viewer can be used for visualizing these.");
+            "Print a lot of verbose information about how matching goes.");
 
 namespace dense_map {
 
@@ -965,9 +975,10 @@ void calc_world_to_cam_no_extrinsics(  // Inputs
 // Use one of the two implementations above. Care is needed as when there are no extrinsics,
 // each camera is on its own, so the input is in world_to_cam_vec and not in world_to_ref_vec
 void calc_world_to_cam_transforms(  // Inputs
-  bool no_extrinsics, std::vector<dense_map::cameraImage> const& cams, std::vector<double> const& world_to_ref_vec,
-  std::vector<double> const& ref_timestamps, std::vector<double> const& ref_to_cam_vec,
-  std::vector<double> const& world_to_cam_vec, std::vector<double> const& ref_to_cam_timestamp_offsets,
+  bool no_extrinsics, std::vector<dense_map::cameraImage> const& cams,
+  std::vector<double> const& world_to_ref_vec, std::vector<double> const& ref_timestamps,
+  std::vector<double> const& ref_to_cam_vec, std::vector<double> const& world_to_cam_vec,
+  std::vector<double> const& ref_to_cam_timestamp_offsets,
   // Output
   std::vector<Eigen::Affine3d>& world_to_cam) {
   if (!no_extrinsics)
@@ -1089,6 +1100,12 @@ void parameterValidation() {
   if (FLAGS_no_extrinsics && FLAGS_float_timestamp_offsets)
       LOG(FATAL) << "Cannot float timestamps with option --no_extrinsics.\n";
 
+  if (FLAGS_save_images_and_depth_clouds && FLAGS_out_dir == "")
+    LOG(FATAL) << "Cannot save images and clouds if no output directory was provided.\n";
+
+  if (FLAGS_save_matches && FLAGS_out_dir == "")
+    LOG(FATAL) << "Cannot save matches if no output directory was provided.\n";
+
   return;
 }
 
@@ -1172,21 +1189,30 @@ void lookupImagesAndBrackets(  // Inputs
   std::vector<int> cloud_start_positions(num_cam_types, 0);
 
   // Populate the data for each camera image
-  for (int ref_it = 0; ref_it < num_ref_cams; ref_it++) {
+  for (int beg_ref_it = 0; beg_ref_it < num_ref_cams; beg_ref_it++) {
     if (ref_cam_type != 0)
       LOG(FATAL) << "It is assumed that the ref cam type is 0.";
 
     bool save_grayscale = true;                       // for matching we will need grayscale
 
+    // For when we have last ref timestamp and last other cam timestamp and they are equal
+    int end_ref_it = beg_ref_it + 1;
+    bool last_timestamp = (end_ref_it == num_ref_cams);
+    if (last_timestamp) end_ref_it = beg_ref_it;
+
     for (int cam_type = ref_cam_type; cam_type < num_cam_types; cam_type++) {
       dense_map::cameraImage cam;
       bool success = false;
+
+      // The ref cam does not need bracketing, but the others need to be bracketed
+      // by ref cam, so there are two cases to consider.
+
       if (cam_type == ref_cam_type) {
-        cam.camera_type       = cam_type;
-        cam.timestamp         = ref_timestamps[ref_it];
-        cam.ref_timestamp     = cam.timestamp;  // the time offset is 0 between ref and itself
-        cam.beg_ref_index = ref_it;
-        cam.end_ref_index = ref_it;
+        cam.camera_type   = cam_type;
+        cam.timestamp     = ref_timestamps[beg_ref_it];
+        cam.ref_timestamp = cam.timestamp;  // the time offset is 0 between ref and itself
+        cam.beg_ref_index = beg_ref_it;
+        cam.end_ref_index = beg_ref_it;  // same index for beg and end
 
         // Start looking up the image timestamp from this position. Some care
         // is needed here.
@@ -1210,22 +1236,27 @@ void lookupImagesAndBrackets(  // Inputs
         image_start_positions[cam_type] = start_pos;  // save for next time
 
       } else {
-        if (ref_it + 1 >= num_ref_cams) break;  // Arrived at the end, cannot do a bracket
+        // Need care here since sometimes ref_cam and current cam can have
+        // exactly the same timestamp, so then bracketing should succeed.
 
         // Convert the bracketing timestamps to current cam's time
         double ref_to_cam_offset = ref_to_cam_timestamp_offsets[cam_type];
-        double left_timestamp    = ref_timestamps[ref_it + 0] + ref_to_cam_offset;
-        double right_timestamp   = ref_timestamps[ref_it + 1] + ref_to_cam_offset;
+        double beg_timestamp     = ref_timestamps[beg_ref_it] + ref_to_cam_offset;
+        double end_timestamp     = ref_timestamps[end_ref_it] + ref_to_cam_offset;
 
-        if (right_timestamp <= left_timestamp)
+        if (end_timestamp < beg_timestamp)
           LOG(FATAL) << "Ref timestamps must be in strictly increasing order.\n";
 
-        if (right_timestamp - left_timestamp > bracket_len)
+        // Allow a little exception for the last timestamp
+        if (end_timestamp == beg_timestamp && !last_timestamp)
+          LOG(FATAL) << "Ref timestamps must be in strictly increasing order.\n";
+
+        if (end_timestamp - beg_timestamp > bracket_len)
           continue;  // Must respect the bracket length
 
         // Find the image timestamp closest to the midpoint of the brackets. This will give
         // more room to vary the timestamp later.
-        double mid_timestamp = (left_timestamp + right_timestamp)/2.0;
+        double mid_timestamp = (beg_timestamp + end_timestamp)/2.0;
 
         // Search forward in time from image_start_positions[cam_type].
         // We will update that too later. One has to be very careful
@@ -1233,24 +1264,29 @@ void lookupImagesAndBrackets(  // Inputs
         // so that at the next iteration we are passed what we
         // search for.
         int start_pos = image_start_positions[cam_type];  // care here
-        double curr_timestamp = left_timestamp;           // start here
+        double curr_timestamp = beg_timestamp;            // start here
         cv::Mat best_image;
         double best_dist = 1.0e+100;
         double best_time = -1.0, found_time = -1.0;
         while (1) {
-          if (found_time >= right_timestamp) break;  // out of range
+          if (found_time > end_timestamp) break;  // out of range
 
           cv::Mat image;
-          if (!dense_map::lookupImage(curr_timestamp, mapVal(bag_map, image_topics[cam_type]),
-                                      save_grayscale,
+          if (!dense_map::lookupImage(curr_timestamp,  // start looking from here
+                                      mapVal(bag_map, image_topics[cam_type]), save_grayscale,
                                       // outputs
                                       image,
-                                      start_pos,  // care here
+                                       // care here, start_pos moves forward
+                                      start_pos,
+                                      // found_time will be updated now
                                       found_time))
             break;  // Need not succeed, but then there's no need to go on are we are at the end
 
+          // Check if the found time is in the bracket
+          bool is_in_bracket = (beg_timestamp <= found_time && found_time <= end_timestamp);
           double curr_dist = std::abs(found_time - mid_timestamp);
-          if (curr_dist < best_dist) {
+
+          if (curr_dist < best_dist && is_in_bracket) {
             best_dist = curr_dist;
             best_time = found_time;
             // Update the start position for the future only if this is a good
@@ -1261,19 +1297,20 @@ void lookupImagesAndBrackets(  // Inputs
 
           // Go forward in time. We count on the fact that
           // lookupImage() looks forward from given guess.
-          curr_timestamp = std::nextafter(found_time, 1.01 * found_time);
+          // Careful here with the api of std::nextafter().
+          curr_timestamp = std::nextafter(found_time, found_time + 1.0);
         }
 
         if (best_time < 0.0) continue;  // bracketing failed
 
-        // Note how we allow best_time == left_timestamp if there's no other choice
-        if (best_time < left_timestamp || best_time >= right_timestamp) continue;  // no luck
+        // Note how we allow best_time == beg_timestamp if there's no other choice
+        if (best_time < beg_timestamp || best_time > end_timestamp) continue;  // no luck
 
         cam.camera_type   = cam_type;
         cam.timestamp     = best_time;
         cam.ref_timestamp = best_time - ref_to_cam_offset;
-        cam.beg_ref_index = ref_it;
-        cam.end_ref_index = ref_it + 1;
+        cam.beg_ref_index = beg_ref_it;
+        cam.end_ref_index = end_ref_it;
         cam.image         = best_image;
 
         success = true;
@@ -1294,15 +1331,15 @@ void lookupImagesAndBrackets(  // Inputs
         double ref_to_cam_offset = ref_to_cam_timestamp_offsets[cam_type];
 
         // cam.timestamp was chosen as centrally as possible so that
-        // ref_timestamps[ref_it + 0] + ref_to_cam_offset <= cam.timestamp
+        // ref_timestamps[beg_ref_it] + ref_to_cam_offset <= cam.timestamp
         // and
-        // cam.timestamp < ref_timestamps[ref_it + 1] + ref_to_cam_offset
+        // cam.timestamp <= ref_timestamps[end_ref_it] + ref_to_cam_offset
         // Find the range of potential future values of ref_to_cam_offset so that
         // cam.timestamp still respects these bounds.
         min_timestamp_offset[cam_type]
-          = std::max(min_timestamp_offset[cam_type], cam.timestamp - ref_timestamps[ref_it + 1]);
+          = std::max(min_timestamp_offset[cam_type], cam.timestamp - ref_timestamps[end_ref_it]);
         max_timestamp_offset[cam_type]
-          = std::min(max_timestamp_offset[cam_type], cam.timestamp - ref_timestamps[ref_it + 0]);
+          = std::min(max_timestamp_offset[cam_type], cam.timestamp - ref_timestamps[beg_ref_it]);
       }
 
       // This can be useful in checking if all the sci cams were bracketed successfully.
@@ -1327,6 +1364,23 @@ void lookupImagesAndBrackets(  // Inputs
       cams.push_back(cam);
     }  // end loop over camera types
   }    // end loop over ref images
+
+  // See how many timestamps we have for each camera
+  std::map<int, int> num_images;
+  for (int cam_type_it = 0; cam_type_it < num_cam_types; cam_type_it++) num_images[cam_type_it] = 0;
+  for (size_t cam_it = 0; cam_it < cams.size(); cam_it++)
+    num_images[cams[cam_it].camera_type]++;
+
+  bool is_good = true;
+  for (int cam_type_it = 0; cam_type_it < num_cam_types; cam_type_it++) {
+    std::cout << "Number of found images for camera: " << cam_names[cam_type_it] << ": "
+              << num_images[cam_type_it] << std::endl;
+
+    if (num_images[cam_type_it] == 0) is_good = false;
+  }
+
+  if (!is_good)
+    LOG(FATAL) << "Could not bracket all images. Cannot continue.\n";
 
   std::cout << "Timestamp offset allowed ranges based on current bracketing:\n";
   // Adjust for timestamp_offsets_max_change
@@ -1649,11 +1703,12 @@ void evalResiduals(  // Inputs
 // Given all the merged and filtered tracks in pid_cid_fid, for each
 // image pair cid1 and cid2 with cid1 < cid2 < cid1 + num_overlaps + 1,
 // save the matches of this pair which occur in the set of tracks.
-void saveInlierMatches(  // Inputs
+void saveInlinerMatchPairs(  // Inputs
   std::vector<std::string> const& image_files, int num_overlaps,
   std::vector<std::map<int, int>> const& pid_to_cid_fid,
   std::vector<std::vector<std::pair<float, float>>> const& keypoint_vec,
-  std::vector<std::map<int, std::map<int, int>>> const& pid_cid_fid_inlier) {
+  std::vector<std::map<int, std::map<int, int>>> const& pid_cid_fid_inlier,
+  std::string const& out_dir) {
   MATCH_MAP matches;
 
   for (size_t pid = 0; pid < pid_to_cid_fid.size(); pid++) {
@@ -1695,12 +1750,14 @@ void saveInlierMatches(  // Inputs
     int right_index = index_pair.second;
 
     auto & left_image  = image_files[left_index];  // alias
-    auto& right_image = image_files[right_index];  // alias
+    auto & right_image = image_files[right_index];  // alias
 
-    std::string left_stem  = boost::filesystem::path(left_image).stem().string();
-    std::string right_stem = boost::filesystem::path(right_image).stem().string();
+    std::string match_dir = out_dir + "/matches";
+    dense_map::createDir(match_dir);
 
-    std::string match_file = left_stem + "__" + right_stem + "-inliers.match";
+    std::string suffix = "-inliers";
+    std::string match_file = dense_map::matchFileName(match_dir, left_image, right_image, suffix);
+
     std::cout << "Writing: " << left_image << ' ' << right_image << ' '
               << match_file << std::endl;
     dense_map::writeMatchFile(match_file, match_pair.first, match_pair.second);
@@ -1964,16 +2021,27 @@ int main(int argc, char** argv) {
                                           &world_to_cam_vec[dense_map::NUM_RIGID_PARAMS * cid]);
   }
 
+  // The image file names are needed to save the images and matches
+  std::vector<std::string> image_files, depth_files;
+
+  if (FLAGS_save_images_and_depth_clouds || FLAGS_save_matches)
+    dense_map::genImageAndDepthFileNames(  // Inputs
+      cams, cam_names, FLAGS_out_dir,
+      // Outputs
+      image_files, depth_files);
+
+  if (FLAGS_save_images_and_depth_clouds)
+    dense_map::saveImagesAndDepthClouds(cams, image_files, depth_files);
+
   // Detect and match features
   std::vector<std::vector<std::pair<float, float>>> keypoint_vec;
   std::vector<std::map<int, int>> pid_to_cid_fid;
-  std::vector<std::string> image_files;  // will be filled only in verbose mode
   dense_map::detectMatchFeatures(  // Inputs
-                                 cams, cam_names, cam_params, world_to_cam,
-                                 FLAGS_num_overlaps, FLAGS_initial_max_reprojection_error,
-                                 FLAGS_num_match_threads, FLAGS_verbose,
-                                 // Outputs
-                                 keypoint_vec, pid_to_cid_fid, image_files);
+    cams, cam_params, image_files, FLAGS_out_dir, FLAGS_save_matches, world_to_cam,
+    FLAGS_num_overlaps, FLAGS_initial_max_reprojection_error, FLAGS_num_match_threads,
+    FLAGS_verbose,
+    // Outputs
+    keypoint_vec, pid_to_cid_fid);
 
   // Set up the block sizes
   std::vector<int> bracketed_cam_block_sizes;
@@ -2182,8 +2250,9 @@ int main(int argc, char** argv) {
         // ref_to_cam is kept fixed at the identity if the cam is the ref type or
         // no extrinsics
         if (extrinsics_to_float.find(cam_names[cam_type]) == extrinsics_to_float.end() ||
-            cam_type == ref_cam_type || FLAGS_no_extrinsics)
+            cam_type == ref_cam_type || FLAGS_no_extrinsics) {
           problem.SetParameterBlockConstant(ref_to_cam_ptr);
+        }
 
         Eigen::Vector3d depth_xyz(0, 0, 0);
         bool have_depth_tri_constraint
@@ -2218,12 +2287,14 @@ int main(int argc, char** argv) {
           // We won't repeat that code here.
           // If we model an affine depth to image, fix its scale here,
           // it will change anyway as part of normalized_depth_to_image_vec.
-          if (!FLAGS_float_scale || FLAGS_affine_depth_to_image)
+          if (!FLAGS_float_scale || FLAGS_affine_depth_to_image) {
             problem.SetParameterBlockConstant(&depth_to_image_scales[cam_type]);
+          }
 
-          if (extrinsics_to_float.find(depth_to_image_name) == extrinsics_to_float.end())
-            problem.SetParameterBlockConstant
-              (&normalized_depth_to_image_vec[num_depth_params * cam_type]);
+          if (extrinsics_to_float.find(depth_to_image_name) == extrinsics_to_float.end()) {
+            problem.SetParameterBlockConstant(
+              &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+          }
         }
 
         // Add the depth to mesh constraint
@@ -2393,9 +2464,9 @@ int main(int argc, char** argv) {
         pid_cid_fid_inlier);
   }  // End optimization passes
 
-  if (FLAGS_verbose)
-    dense_map::saveInlierMatches(image_files, FLAGS_num_overlaps, pid_to_cid_fid,
-                                 keypoint_vec, pid_cid_fid_inlier);
+  if (FLAGS_save_matches)
+    dense_map::saveInlinerMatchPairs(image_files, FLAGS_num_overlaps, pid_to_cid_fid,
+                                     keypoint_vec, pid_cid_fid_inlier, FLAGS_out_dir);
 
   bool map_changed = (FLAGS_num_iterations > 0 &&
                       (FLAGS_float_sparse_map || FLAGS_nav_cam_intrinsics_to_float != ""));
@@ -2441,21 +2512,22 @@ int main(int argc, char** argv) {
   std::cout << "Writing: " << FLAGS_output_map << std::endl;
   sparse_map->Save(FLAGS_output_map);
 
+  // Update the transforms from the world to every camera
+  dense_map::calc_world_to_cam_transforms(  // Inputs
+    FLAGS_no_extrinsics, cams, world_to_ref_vec, ref_timestamps, ref_to_cam_vec, world_to_cam_vec,
+    ref_to_cam_timestamp_offsets,
+    // Output
+    world_to_cam);
+
   if (FLAGS_out_texture_dir != "") {
     // Project each image onto the mesh
 
     if (FLAGS_mesh == "")
       LOG(FATAL) << "Cannot project camera images onto a mesh if a mesh was not provided.\n";
 
-    // The transform from the world to every camera must be updated
     // TODO(oalexan1): Why the call below works without dense_map:: prepended to it?
     // TODO(oalexan1): This call to calc_world_to_cam_transforms is likely not
     // necessary since world_to_cam has been updated by now.
-    dense_map::calc_world_to_cam_transforms(  // Inputs
-      FLAGS_no_extrinsics, cams, world_to_ref_vec, ref_timestamps, ref_to_cam_vec, world_to_cam_vec,
-      ref_to_cam_timestamp_offsets,
-      // Output
-      world_to_cam);
     dense_map::meshProjectCameras(cam_names, cam_params, cams, world_to_cam, mesh, bvh_tree,
                                   ref_cam_type, FLAGS_nav_cam_num_exclude_boundary_pixels,
                                   FLAGS_out_texture_dir);
@@ -2463,4 +2535,3 @@ int main(int argc, char** argv) {
 
   return 0;
 }
-

@@ -679,7 +679,7 @@ def undistort_images(
         "--save_bgr",
         "--robot_camera",
         cam_type,
-        "-image_list",
+        "--image_list",
         dist_image_list,
         "--scale",
         str(scale),
