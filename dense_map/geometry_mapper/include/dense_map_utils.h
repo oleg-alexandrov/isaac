@@ -48,6 +48,11 @@ const int NUM_XYZ_PARAMS     = 3;                                       // NOLIN
 const int NUM_RIGID_PARAMS   = 7;  // quaternion (4) + translation (3)  // NOLINT
 const int NUM_AFFINE_PARAMS  = 12; // 3x3 matrix (9) + translation (3)  // NOLINT
 
+const std::string NO_DEPTH_FILE      = "no_depth_file";
+const std::string FISHEYE_DISTORTION = "fisheye";
+const std::string RADTAN_DISTORTION  = "radtan";
+const std::string NO_DISTORION       = "no_distortion";
+
 // A  function to split a string like 'optical_center focal_length' into
 // its two constituents.
 void parse_intrinsics_to_float(std::string const& intrinsics_to_float,

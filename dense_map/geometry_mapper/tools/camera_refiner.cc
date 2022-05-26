@@ -1758,10 +1758,333 @@ void saveInlinerMatchPairs(  // Inputs
     std::string suffix = "-inliers";
     std::string match_file = dense_map::matchFileName(match_dir, left_image, right_image, suffix);
 
-    std::cout << "Writing: " << left_image << ' ' << right_image << ' '
-              << match_file << std::endl;
+    std::cout << "Writing: " << match_file << std::endl;
     dense_map::writeMatchFile(match_file, match_pair.first, match_pair.second);
   }
+}
+
+// TODO(oalexan1): Move this to utils
+// Save an affine transform represented as a matrix to a file.
+std::string affineToStr(Eigen::Affine3d const& M) {
+  Eigen::MatrixXd T = M.matrix();
+  std::ostringstream os;
+  os.precision(17);
+  os << T(0, 0) << " " << T(0, 1) << " " << T(0, 2) << " "
+     << T(1, 0) << " " << T(1, 1) << " " << T(1, 2) << " "
+     << T(2, 0) << " " << T(2, 1) << " " << T(2, 2) << " "
+     << T(0, 3) << " " << T(1, 3) << " " << T(2, 3);
+
+  return os.str();
+}
+
+// Form an affine transform from 12 values
+Eigen::Affine3d vecToAffine(Eigen::VectorXd const& vals) {
+  if (vals.size() != 12)
+    LOG(FATAL) << "An affine transform must have 12 parameters.\n";
+
+  Eigen::Affine3d M = Eigen::Affine3d::Identity();
+  Eigen::MatrixXd T = M.matrix();
+
+  int count = 0;
+
+  // linear part
+  T(0, 0) = vals[count++];
+  T(0, 1) = vals[count++];
+  T(0, 2) = vals[count++];
+  T(1, 0) = vals[count++];
+  T(1, 1) = vals[count++];
+  T(1, 2) = vals[count++];
+  T(2, 0) = vals[count++];
+  T(2, 1) = vals[count++];
+  T(2, 2) = vals[count++];
+
+  // translation part
+  T(0, 3) = vals[count++];
+  T(1, 3) = vals[count++];
+  T(2, 3) = vals[count++];
+
+  M.matrix() = T;
+
+  return M;
+}
+
+// TODO(oalexan1): Move this to utils
+
+// Save the properties of images. Use space as separator.
+void writeImageList(std::string const& out_dir, std::vector<dense_map::cameraImage> const& cams,
+                    std::vector<std::string> const& image_files,
+                    std::vector<std::string> const& depth_files,
+                    std::vector<Eigen::Affine3d> const& world_to_cam) {
+  dense_map::createDir(out_dir);
+  std::string image_list = out_dir + "/images.txt";
+  std::cout << "Writing: " << image_list << std::endl;
+
+  std::ofstream f;
+  f.open(image_list.c_str(), std::ios::binary | std::ios::out);
+  if (!f.is_open()) LOG(FATAL) << "Cannot open file for writing: " << image_list << "\n";
+  f.precision(17);
+
+  f << "# image_file sensor_id timestamp depth_file world_to_image\n";
+
+  for (size_t it = 0; it < cams.size(); it++) {
+    std::string depth_cloud_name = depth_files[it];
+    if (cams[it].depth_cloud.cols == 0 || cams[it].depth_cloud.rows == 0)
+      depth_cloud_name = dense_map::NO_DEPTH_FILE;
+
+    // Convert an affine transform to a 4x4 matrix
+    Eigen::MatrixXd T = world_to_cam[it].matrix();
+
+    // Save the rotation and translation of T
+    f << image_files[it] << " " << cams[it].camera_type  << " " <<
+      cams[it].timestamp << " " << depth_cloud_name << " "
+      << dense_map::affineToStr(world_to_cam[it]) << "\n";
+  }
+
+  f.close();
+}
+
+// Save the optimized rig configuration
+void writeRigConfig(std::string const& out_dir, bool model_rig, int ref_cam_type,
+                    std::vector<camera::CameraParameters> const& cam_params,
+                    std::vector<Eigen::Affine3d> const& ref_to_cam_trans,
+                    std::vector<Eigen::Affine3d> const& depth_to_image,
+                    std::vector<double> const& ref_to_cam_timestamp_offsets) {
+  if (ref_cam_type != 0)
+    LOG(FATAL) << "The reference camera id must be always 0.\n";
+
+  dense_map::createDir(out_dir);
+  std::string rig_config = out_dir + "/rig_config.txt";
+  std::cout << "Writing: " << rig_config << std::endl;
+
+  std::ofstream f;
+  f.open(rig_config.c_str(), std::ios::binary | std::ios::out);
+  if (!f.is_open()) LOG(FATAL) << "Cannot open file for writing: " << rig_config << "\n";
+  f.precision(17);
+
+  f << "ref_sensor_id: " << ref_cam_type << "\n";
+
+  for (size_t cam_type = ref_cam_type; cam_type < cam_params.size(); cam_type++) {
+    f << "\n";
+    f << "sensor_id: " << cam_type << "\n";
+    f << "focal_length: " << cam_params[cam_type].GetFocalLength() << "\n";
+
+    Eigen::Vector2d c = cam_params[cam_type].GetOpticalOffset();
+    f << "optical_center: " << c[0] << " " << c[1] << "\n";
+
+    Eigen::VectorXd D = cam_params[cam_type].GetDistortion();
+
+    f << "distortion_coeffs: ";
+    for (int d = 0; d < D.size(); d++) {
+      f << D[d];
+      if (d + 1 < D.size()) f << " ";
+    }
+    f << "\n";
+
+    if (D.size() == 0) f << "distortion_type: " << dense_map::NO_DISTORION << "\n";
+    if (D.size() == 1)
+      f << "distortion_type: " << dense_map::FISHEYE_DISTORTION << "\n";
+    else if (D.size() >= 4 && D.size() <= 5)
+      f << "distortion_type: " << dense_map::RADTAN_DISTORTION << "\n";
+    else
+      LOG(FATAL) << "Expecting 0, 1, 4, or 5 distortion coefficients.\n";
+
+    Eigen::Vector2i image_size = cam_params[cam_type].GetDistortedSize();
+    f << "image_size: " << image_size[0] << ' ' << image_size[1] << "\n";
+
+    Eigen::Vector2i undist_size = cam_params[cam_type].GetUndistortedSize();
+    f << "undistorted_image_size: " << undist_size[0] << ' ' << undist_size[1] << "\n";
+
+    // This is very important. When we don't assume a rig,
+    // the transform among the sensors should be invalid.
+    Eigen::Affine3d Zero;
+    Zero.matrix() = 0 * Zero.matrix();
+    Eigen::Affine3d T;
+
+    if (model_rig)
+      T = ref_to_cam_trans[cam_type];
+    else
+      T = Zero;
+
+    f << "ref_to_sensor_transform: "
+      << dense_map::affineToStr(T)
+      << "\n";
+
+    f << "depth_to_image_transform: "
+      << dense_map::affineToStr(depth_to_image[cam_type]) << "\n";
+
+    f << "ref_to_sensor_timestamp_offset: " << ref_to_cam_timestamp_offsets[cam_type] << "\n";
+  }
+
+  f.close();
+}
+
+// Read real values after given tag. Ignore comments, so any line starting
+// with #, and empty lines. If desired_num_vals >=0, validate that we
+// read the desired number.
+void readConfigVals(std::ifstream & f, std::string const& tag, int desired_num_vals,
+                    Eigen::VectorXd & vals) {
+  // Clear the output
+  vals.resize(0);
+
+  std::vector<double> local_vals;  // std::vector has push_back()
+  std::string line;
+  while (getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    std::istringstream iss(line);
+    std::string token;
+    iss >> token;
+    double val = 0.0;
+    while (iss >> val) {
+      local_vals.push_back(val);
+    }
+
+    if (token != tag) throw std::runtime_error("Could not read value for: " + tag);
+
+    // Copy to Eigen::VectorXd
+    vals.resize(local_vals.size());
+    for (int it = 0; it < vals.size(); it++) vals[it] = local_vals[it];
+
+    if (desired_num_vals >= 0 && vals.size() != desired_num_vals)
+      throw std::runtime_error("Read an incorrect number of values for: " + tag);
+
+    return;
+  }
+
+  throw std::runtime_error("Could not read value for: " + tag);
+}
+
+// Read strings separated by spaces after given tag. Ignore comments, so any line starting
+// with #, and empty lines. If desired_num_vals >=0, validate that we
+// read the desired number.
+void readConfigVals(std::ifstream & f, std::string const& tag, int desired_num_vals,
+                    std::vector<std::string> & vals) {
+  // Clear the output
+  vals.resize(0);
+
+  std::string line;
+  while (getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    std::istringstream iss(line);
+    std::cout << "iss" << std::endl;
+    std::string token;
+    iss >> token;
+    std::string val;
+    while (iss >> val)
+      vals.push_back(val);
+
+    if (token != tag) throw std::runtime_error("Could not read value for: " + tag);
+
+    if (desired_num_vals >= 0 && vals.size() != desired_num_vals)
+      throw std::runtime_error("Read an incorrect number of values for: " + tag);
+
+    return;
+  }
+
+  throw std::runtime_error("Could not read value for: " + tag);
+}
+
+// Read a rig configuration. Check if the transforms among the sensors
+// on the rig is not 0, in that case will use it.
+void readRigConfig(std::string const& rig_config, bool & have_rig_transforms, int & ref_cam_type,
+                   std::vector<camera::CameraParameters> & cam_params,
+                   std::vector<Eigen::Affine3d> & ref_to_cam_trans,
+                   std::vector<Eigen::Affine3d> & depth_to_image,
+                   std::vector<double> & ref_to_cam_timestamp_offsets) {
+  // Initialize the outputs
+  have_rig_transforms = true;
+  ref_cam_type = 0;
+  cam_params.clear();
+  ref_to_cam_trans.clear();
+  depth_to_image.clear();
+  ref_to_cam_timestamp_offsets.clear();
+
+  // Open the file
+  std::cout << "Reading: " << rig_config << std::endl;
+  std::ifstream f;
+  f.open(rig_config.c_str(), std::ios::binary | std::ios::in);
+  if (!f.is_open()) LOG(FATAL) << "Cannot open file for reading: " << rig_config << "\n";
+
+  // Read the ref sensor id
+  Eigen::VectorXd vals;
+  readConfigVals(f, "ref_sensor_id:", 1, vals);
+  ref_cam_type = vals[0];
+  if (ref_cam_type != 0) LOG(FATAL) << "The reference sensor id must be 0.\n";
+
+  // Read each sensor
+  int sensor_it = -1;
+  while (1) {
+    sensor_it++;
+
+    try {
+      readConfigVals(f, "sensor_id:", 1, vals);
+    } catch(...) {
+      // Likely no more sensors
+      return;
+    }
+    int sensor_id = vals[0];
+    if (sensor_id != sensor_it) LOG(FATAL) << "Expecting to read sensor id: " << sensor_it << "\n";
+
+    readConfigVals(f, "focal_length:", 1, vals);
+    Eigen::Vector2d focal_length(vals[0], vals[0]);
+
+    readConfigVals(f, "optical_center:", 2, vals);
+    Eigen::Vector2d optical_center(vals[0], vals[1]);
+
+    readConfigVals(f, "distortion_coeffs:", -1, vals);
+    if (vals.size() != 0 && vals.size() != 1 && vals.size() != 4 && vals.size() != 5)
+      LOG(FATAL) << "Expecting 0, 1, 4, or 5 distortion coefficients.\n";
+    Eigen::VectorXd distortion = vals;
+
+    std::vector<std::string> str_vals;
+    readConfigVals(f, "distortion_type:", 1, str_vals);
+    if (distortion.size() == 0 && str_vals[0] != dense_map::NO_DISTORION)
+      LOG(FATAL) << "When there are no distortion coefficients, distortion type must be: "
+                 << dense_map::NO_DISTORION << "\n";
+    if (distortion.size() == 1 && str_vals[0] != dense_map::FISHEYE_DISTORTION)
+      LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
+                 << dense_map::FISHEYE_DISTORTION << "\n";
+    if ((distortion.size() == 4 || distortion.size() == 5) &&
+        str_vals[0] != dense_map::RADTAN_DISTORTION)
+      LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
+                 << dense_map::RADTAN_DISTORTION << "\n";
+
+    readConfigVals(f, "image_size:", 2, vals);
+    Eigen::Vector2i image_size(vals[0], vals[1]);
+
+    readConfigVals(f, "undistorted_image_size:", 2, vals);
+    Eigen::Vector2i undistorted_image_size(vals[0], vals[1]);
+
+    camera::CameraParameters params(image_size, focal_length, optical_center, distortion);
+    params.SetUndistortedSize(undistorted_image_size);
+    cam_params.push_back(params);
+
+    readConfigVals(f, "ref_to_sensor_transform:", 12, vals);
+    ref_to_cam_trans.push_back(vecToAffine(vals));
+
+    // Sanity check
+    if (have_rig_transforms &&
+        ref_to_cam_trans.back().matrix() == 0 * ref_to_cam_trans.back().matrix()) {
+      std::cout << "Found that ref_to_sensor_transform is zero. Will ignore it." << std::endl;
+      have_rig_transforms = false;
+    }
+
+    readConfigVals(f, "depth_to_image_transform:", 12, vals);
+    depth_to_image.push_back(vecToAffine(vals));
+
+    readConfigVals(f, "ref_to_sensor_timestamp_offset:", 1, vals);
+    double timestamp_offset = vals[0];
+    ref_to_cam_timestamp_offsets.push_back(timestamp_offset);
+  }
+
+  // Sanity check
+  if (have_rig_transforms) {
+    if (ref_to_cam_trans[0].matrix() != Eigen::Affine3d::Identity().matrix())
+      LOG(FATAL) << "The transform from the reference sensor to itself must be the identity.\n";
+  }
+
+  return;
 }
 
 }  // namespace dense_map
@@ -2471,6 +2794,7 @@ int main(int argc, char** argv) {
   bool map_changed = (FLAGS_num_iterations > 0 &&
                       (FLAGS_float_sparse_map || FLAGS_nav_cam_intrinsics_to_float != ""));
   if (map_changed) {
+    // Rebuild the map. This does not change the poses.
     std::cout << "Either the sparse map intrinsics or cameras got modified. "
               << "The map must be rebuilt." << std::endl;
     dense_map::RebuildMap(FLAGS_output_map,  // Will be used for temporary saving of aux data
@@ -2495,13 +2819,33 @@ int main(int argc, char** argv) {
       normalized_depth_to_image[cam_type].translation() *= map_scale;
       // This is a rotation + translation, so only the translation needs the scale
       ref_to_cam_trans[cam_type].translation() *= map_scale;
+
+      // TODO(oalexan1): This messes up the sparse map, which will likely require updating
+      // world_to_ref_vec, and maybe other things.  First pull the camera transforms
+      // from the registered sparse maps, and see what that affects.
+      // Also consider the cases when we model or not the transform among sensors.
+
+      // This is a bug if further changes are not done here, when registration is happening.
+      LOG(FATAL) << "This is a bug. Registration is failing unless world_to_ref_vec "
+                 << "and other quantities are updated.\n";
+
+      // Update ref_to_cam_vec
+      dense_map::rigid_transform_to_array(
+        ref_to_cam_trans[cam_type],                                // input
+        &ref_to_cam_vec[dense_map::NUM_RIGID_PARAMS * cam_type]);  // output
     }
   }
 
-  // Update the optimized depth to image (for haz cam only)
+  // Fuse back normalized_depth_to_image and depth_to_image_scales
+  std::vector<Eigen::Affine3d> depth_to_image(num_cam_types);
+  for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
+    depth_to_image[cam_type] = normalized_depth_to_image[cam_type];
+    depth_to_image[cam_type].linear() *= depth_to_image_scales[cam_type];
+  }
+
+  // Update this for haz_cam
   haz_cam_depth_to_image_scale = depth_to_image_scales[haz_cam_type];
-  haz_cam_depth_to_image_transform = normalized_depth_to_image[haz_cam_type];
-  haz_cam_depth_to_image_transform.linear() *= haz_cam_depth_to_image_scale;
+  haz_cam_depth_to_image_transform = depth_to_image[haz_cam_type];
 
   // Update the config file
   dense_map::updateConfigFile(cam_names, "haz_cam_depth_to_image_transform",
@@ -2533,5 +2877,24 @@ int main(int argc, char** argv) {
                                   FLAGS_out_texture_dir);
   }
 
+  if (FLAGS_save_images_and_depth_clouds) {
+    dense_map::writeImageList(FLAGS_out_dir, cams, image_files, depth_files, world_to_cam);
+
+    bool model_rig = (!FLAGS_no_extrinsics);
+    dense_map::writeRigConfig(FLAGS_out_dir, model_rig, ref_cam_type, cam_params,
+                              ref_to_cam_trans, depth_to_image, ref_to_cam_timestamp_offsets);
+
+    std::string rig_config = FLAGS_out_dir + "/rig_config.txt";
+    bool have_rig_transforms = false;
+    try {
+      dense_map::readRigConfig(rig_config, have_rig_transforms, ref_cam_type, cam_params,
+                               ref_to_cam_trans, depth_to_image, ref_to_cam_timestamp_offsets);
+    } catch(std::exception const& e) {
+      LOG(FATAL) << e.what() << "\n";
+    }
+
+    dense_map::writeRigConfig("tmp3", model_rig, ref_cam_type, cam_params,
+                              ref_to_cam_trans, depth_to_image, ref_to_cam_timestamp_offsets);
+  }
   return 0;
-}
+} // NOLINT // TODO(oalexan1): Remove this
