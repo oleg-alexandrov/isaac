@@ -1812,6 +1812,11 @@ This program's options are:
      Save the interest point matches. Stereo Pipeline's viewer can be used for
      visualizing these. Implies that -out_dir is set.
 
+   --image_list (string, default = "")
+     Read images and camera poses from this list, rather than a sparse map and
+     bag file. The same format is used as for when this tool saves the outputs
+     with the --save_images_and_depth_clouds option.
+
    --verbose (bool, false unless specified)
       Print the residuals and save the images and match files. Stereo
       Pipeline's viewer can be used for visualizing these.

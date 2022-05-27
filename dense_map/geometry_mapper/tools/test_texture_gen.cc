@@ -24,6 +24,7 @@
 #include <camera/camera_params.h>
 #include <camera/camera_model.h>
 #include <dense_map_utils.h>
+#include <system_utils.h>
 #include <texture_processing.h>
 
 #include <boost/filesystem.hpp>

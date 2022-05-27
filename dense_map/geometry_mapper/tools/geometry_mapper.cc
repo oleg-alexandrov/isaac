@@ -52,6 +52,7 @@
 
 #include <dense_map_ros_utils.h>
 #include <dense_map_utils.h>
+#include <system_utils.h>
 #include <happly.h>  // for reading and writing ply files
 
 #include <string>

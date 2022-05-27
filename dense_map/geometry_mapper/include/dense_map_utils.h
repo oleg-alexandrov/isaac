@@ -175,9 +175,6 @@ void bestFitPlane(const std::vector<Eigen::Vector3d>& points, Eigen::Vector3d& c
 // Extract from a string of the form someDir/1234.5678.jpg the number 123.456.
 double fileNameToTimestamp(std::string const& file_name);
 
-// Create a directory recursively, unless it exists already. This works like mkdir -p.
-void createDir(std::string const& dir);
-
 // A little holding structure for nav, sci, and haz poses
 struct CameraPoses {
   std::map<double, double> haz_depth_to_image_timestamps;
@@ -249,6 +246,22 @@ void genImageAndDepthFileNames(  // Inputs
 void saveImagesAndDepthClouds(std::vector<cameraImage> const& cams,
                               std::vector<std::string> const& image_files,
                               std::vector<std::string> const& depth_files);
+
+
+// A struct to collect together some attributes of an image or depth cloud
+// (stored as an image with 3 channels)
+struct ImageMessage {
+  cv::Mat image;
+  double timestamp;
+  std::string name;
+};
+
+// Find an image at the given timestamp or right after it. We assume
+// that during repeated calls to this function we always travel
+// forward in time, and we keep track of where we are in the vector using
+// the variable beg_pos that we update as we go.
+bool lookupImage(double desired_time, std::vector<ImageMessage> const& msgs,
+                 cv::Mat& image, int& beg_pos, double& found_time);
 
 }  // namespace dense_map
 

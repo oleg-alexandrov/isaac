@@ -22,6 +22,7 @@
 #include <ff_common/utils.h>
 #include <msg_conversions/msg_conversions.h>
 
+#include <system_utils.h>
 #include <dense_map_utils.h>
 #include <camera_image.h>
 
@@ -516,16 +517,6 @@ double fileNameToTimestamp(std::string const& file_name) {
 
   std::string frameStr = file_name.substr(beg + 1, end - beg - 1);
   return atof(frameStr.c_str());
-}
-
-// Create a directory recursively, unless it exists already. This works like mkdir -p.
-void createDir(std::string const& dir) {
-  if (dir == "") return;  // This can be useful if dir was created with parent_path().
-
-  if (!boost::filesystem::exists(dir)) {
-    if (!boost::filesystem::create_directories(dir) || !boost::filesystem::is_directory(dir))
-      LOG(FATAL) << "Failed to create directory: " << dir << "\n";
-  }
 }
 
 // Minor utilities for converting values to a string below
@@ -1049,19 +1040,23 @@ void genImageAndDepthFileNames(  // Inputs
 
   char buffer[1000];
   for (size_t it = 0; it < cams.size(); it++) {
-    // Use the timestamp as image name. We use this convention in many places,
-    // and will later look up the timestamp from image name.
-    // Note that several sensors can produce images with same timestamp,
-    // so also keep track of camera name.
+    // Use the timestamp as image and depth cloud names, unless those
+    // names already exist. Note that several sensors can produce
+    // images with same timestamp, so also keep track of camera name.
     std::string cam_dir = out_dir + "/" + cam_names[cams[it].camera_type];
-    snprintf(buffer, sizeof(buffer), "%s/%10.7f.jpg",
-             cam_dir.c_str(), cams[it].timestamp);
-    image_files.push_back(buffer);
+    std::string image_name;
+    // Will use .tif images, as those are lossless
+    snprintf(buffer, sizeof(buffer), "%10.7f.tif", cams[it].timestamp);
+    image_name = buffer;
+    image_name = cam_dir + "/" + image_name;
+    image_files.push_back(image_name);
 
-    std::string cloud_dir = cam_dir + "_depth";
-    snprintf(buffer, sizeof(buffer), "%s/%10.7f.pc",
-             cloud_dir.c_str(), cams[it].timestamp);
-    depth_files.push_back(buffer);
+    std::string depth_dir = cam_dir + "_depth";
+    std::string depth_name;
+    snprintf(buffer, sizeof(buffer), "%10.7f.pc", cams[it].timestamp);
+    depth_name = buffer;
+    depth_name = depth_dir + "/" + depth_name;
+    depth_files.push_back(depth_name);
   }
 }
 
@@ -1091,6 +1086,43 @@ void saveImagesAndDepthClouds(std::vector<dense_map::cameraImage> const& cams,
   }
 
   return;
+}
+
+// Find an image at the given timestamp or right after it. We assume
+// that during repeated calls to this function we always travel
+// forward in time, and we keep track of where we are in the bag using
+// the variable start_pos that we update as we go.
+bool lookupImage(double desired_time, std::vector<ImageMessage> const& msgs,
+                 cv::Mat& image, int& start_pos, double& found_time) {
+  // Initialize the outputs.
+  image = cv::Mat();
+  found_time = -1.0;
+
+  int num_msgs = msgs.size();
+  double prev_image_time = -1.0;
+
+  for (int local_pos = start_pos; local_pos < num_msgs; local_pos++) {
+    start_pos = local_pos;  // save this for exporting
+
+    found_time = msgs[local_pos].timestamp;
+
+    // Sanity check: We must always travel forward in time
+    if (found_time < prev_image_time) {
+      LOG(FATAL) << "Found images not in chronological order.\n"
+                 << std::fixed << std::setprecision(17)
+                 << "Times in wrong order: " << prev_image_time << ' ' << found_time << ".\n";
+      continue;
+    }
+
+    prev_image_time = found_time;
+
+    if (found_time >= desired_time) {
+      // Found the desired data. Do a deep copy, to not depend on the original structure.
+      msgs[local_pos].image.copyTo(image);
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // end namespace dense_map

@@ -23,7 +23,7 @@
 
 #include <interest_point.h>           // from the isaac repo
 #include <camera_image.h>             // from the isaac repo
-#include <dense_map_utils.h>
+#include <system_utils.h>
 #include <interest_point/matching.h>  // from the astrobee repo
 
 // Get rid of warnings beyond our control

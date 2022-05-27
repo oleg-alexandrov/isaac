@@ -40,6 +40,8 @@
 // Boost includes
 #include <boost/filesystem.hpp>
 
+#include <system_utils.h>
+
 // texrecon includes
 #include <mve/image_io.h>
 #include <mve/image_tools.h>
