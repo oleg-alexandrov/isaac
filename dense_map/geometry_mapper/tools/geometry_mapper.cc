@@ -52,6 +52,7 @@
 
 #include <dense_map_ros_utils.h>
 #include <dense_map_utils.h>
+#include <dense_map_lua_config.h>
 #include <system_utils.h>
 #include <happly.h>  // for reading and writing ply files
 
@@ -1560,7 +1561,7 @@ int main(int argc, char** argv) {
   Eigen::Affine3d nav_cam_to_body_trans;  // Will not be used
   Eigen::Affine3d                       haz_cam_depth_to_image_transform;
   if (!FLAGS_simulated_data) {
-    dense_map::readConfigFile(  // Inputs
+    dense_map::readLuaConfig(  // Inputs
       cam_types,
       "nav_cam_transform",  // this is the nav cam to body transform
       "haz_cam_depth_to_image_transform",

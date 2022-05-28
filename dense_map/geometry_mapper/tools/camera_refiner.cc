@@ -99,32 +99,26 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/core/utility.hpp>
 
-#include <ros/ros.h>
-#include <cv_bridge/cv_bridge.h>
-#include <image_transport/image_transport.h>
-#include <rosbag/view.h>
-#include <sensor_msgs/Image.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/image_encodings.h>
-#include <sensor_msgs/point_cloud2_iterator.h>
+// Conditional dependence on Astrobee, ROS, Lua, protobuf, and
+// SparseMap
+#define HAVE_ASTROBEE 1
+#if HAVE_ASTROBEE
+#include <ff_common/utils.h>
+#include <sparse_mapping/sparse_map.h>
+#include <sparse_mapping/tensor.h>
+#include <sparse_map_utils.h>
+#include <dense_map_ros_utils.h>
+#include <dense_map_lua_config.h>
+#else
+#include <dense_map_noros_utils.h>
+#endif
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include <pcl/io/ply_io.h>
-#include <pcl/io/pcd_io.h>
-
 #include <Eigen/Geometry>
 #include <Eigen/Core>
 
-#include <ff_common/utils.h>
-#include <sparse_mapping/sparse_map.h>
-#include <sparse_mapping/reprojection.h>
-#include <sparse_mapping/tensor.h>
-#include <config_reader/config_reader.h>
-#include <msg_conversions/msg_conversions.h>
-
-#include <dense_map_ros_utils.h>
 #include <dense_map_utils.h>
 #include <system_utils.h>
 #include <interest_point.h>
@@ -133,9 +127,10 @@
 
 #include <string>
 #include <map>
-#include <array>
 #include <iostream>
 #include <fstream>
+
+#if HAVE_ASTROBEE
 
 DEFINE_string(ros_bag, "", "A ROS bag with recorded nav_cam, haz_cam intensity, "
               "full-resolution sci_cam, and haz_cam depth clouds.");
@@ -156,6 +151,8 @@ DEFINE_string(haz_cam_intensity_topic, "/hw/depth_haz/extended/amplitude_int",
               "The depth camera intensity topic in the bag file.");
 
 DEFINE_string(sci_cam_topic, "/hw/cam_sci/compressed", "The sci cam topic in the bag file.");
+
+#endif
 
 DEFINE_int32(num_overlaps, 10, "How many images (of all camera types) close and forward in "
              "time to match to given image.");
@@ -196,7 +193,7 @@ DEFINE_string(extrinsics_to_float, "haz_cam sci_cam depth_to_image",
               "consider if to float the haz_cam depth_to_image transform.");
 
 DEFINE_bool(float_scale, false,
-            "If to optimize the scale of the clouds, part of haz_cam_depth_to_image_transform "
+            "If to optimize the scale of the clouds, part of haz_cam depth_to_image transform "
             "(use it if the sparse map is kept fixed, or else rescaling and registration "
             "of the map and extrinsics is needed). This parameter should not be used with "
             "--affine_depth_to_image when the transform is affine, rather than rigid and a scale."
@@ -210,6 +207,8 @@ DEFINE_bool(float_sparse_map, false,
 DEFINE_bool(float_timestamp_offsets, false,
             "If to optimize the timestamp offsets among the cameras.");
 
+// TODO(oalexan1): This must be enabled for all sensor with a per-sensor exclusion
+// distance.
 DEFINE_int32(nav_cam_num_exclude_boundary_pixels, 0,
              "Flag as outliers nav cam pixels closer than this to the boundary, and ignore "
              "that boundary region when texturing with the --out_texture_dir option. "
@@ -277,13 +276,6 @@ DEFINE_double(min_ray_dist, 0.0, "The minimum search distance from a starting po
 DEFINE_double(max_ray_dist, 100.0, "The maximum search distance from a starting point along a ray "
               "when intersecting the ray with a mesh, in meters (if applicable).");
 
-DEFINE_string(nav_cam_distortion_replacement, "",
-              "Replace nav_cam's distortion coefficients with this list after the initial "
-              "determination of triangulated points, and then continue with distortion "
-              "optimization. A quoted list five values is expected, separated by "
-              "spaces, as the replacement distortion model will have radial and tangential "
-              "coefficients. Set a positive --nav_cam_num_exclude_boundary_pixels.");
-
 DEFINE_bool(registration, false,
             "If true, and registration control points for the sparse map exist and are specified "
             "by --hugin_file and --xyz_file, re-register the sparse map at the end. All the "
@@ -319,6 +311,11 @@ DEFINE_string(out_dir, "",
 
 DEFINE_bool(save_images_and_depth_clouds, false,
             "Save the images and point clouds used in processing. Implies that --out_dir is set.");
+
+DEFINE_string(rig_config, "",
+              "Read the rig configuration from this plain text file rather than from "
+              "robot's lua-based config file. The same format is used as for when this tool "
+              "saves the outputs with the --save_images_and_depth_clouds option.");
 
 DEFINE_string(image_list, "",
               "Read images and camera poses from this list, rather than a sparse map and "
@@ -820,7 +817,8 @@ void meshProjectCameras(std::vector<std::string> const& cam_names,
                         std::vector<Eigen::Affine3d> const& world_to_cam,
                         mve::TriangleMesh::Ptr const& mesh,
                         std::shared_ptr<BVHTree> const& bvh_tree,
-                        int ref_camera_type, int nav_cam_num_exclude_boundary_pixels,
+                        int ref_camera_type,
+                        int nav_cam_num_exclude_boundary_pixels,
                         std::string const& out_dir) {
   if (cam_names.size() != cam_params.size())
     LOG(FATAL) << "There must be as many camera names as sets of camera parameters.\n";
@@ -848,86 +846,6 @@ void meshProjectCameras(std::vector<std::string> const& cam_names,
     meshProject(mesh, bvh_tree, cam_images[cid].image, world_to_cam[cid], cam_params[cam_type],
                 num_exclude_boundary_pixels, out_prefix);
   }
-}
-
-// Rebuild the map.
-// TODO(oalexan1): This must be integrated in astrobee.
-void RebuildMap(std::string const& map_file,  // Will be used for temporary saving of aux data
-                camera::CameraParameters const& cam_params,
-                boost::shared_ptr<sparse_mapping::SparseMap> sparse_map) {
-  std::string rebuild_detector = "SURF";
-  std::cout << "Rebuilding map with " << rebuild_detector << " detector.";
-
-  // Set programatically the command line option for astrobee's map
-  // building min angle based on the corresponding refiner flag.
-  std::ostringstream oss;
-  oss << FLAGS_refiner_min_angle;
-  std::string min_valid_angle = oss.str();
-  google::SetCommandLineOption("min_valid_angle", min_valid_angle.c_str());
-  if (!gflags::GetCommandLineOption("min_valid_angle", &min_valid_angle))
-    LOG(FATAL) << "Failed to get the value of --min_valid_angle in Astrobee "
-               << "map-building software.\n";
-  // The newline below is due to the sparse map software not putting a newline
-  std::cout << "\nSetting --min_valid_angle " << min_valid_angle << ".\n";
-
-  // Make the map rebuilding in the Astrobee software not print so much matching info
-  if (!FLAGS_verbose)
-    google::SetCommandLineOption("silent_matching", "true");
-
-  // Copy some data to make sure it does not get lost on resetting things below
-  std::vector<Eigen::Affine3d>    world_to_ref_t = sparse_map->cid_to_cam_t_global_;
-  std::vector<std::map<int, int>> pid_to_cid_fid = sparse_map->pid_to_cid_fid_;
-
-  // Ensure the new camera parameters are set
-  sparse_map->SetCameraParameters(cam_params);
-
-  std::cout << "Detecting features.";
-  sparse_map->DetectFeatures();
-
-  std::cout << "Matching features.";
-  // Borrow from the original map which images should be matched with which.
-  sparse_map->cid_to_cid_.clear();
-  for (size_t p = 0; p < pid_to_cid_fid.size(); p++) {
-    std::map<int, int> const& track = pid_to_cid_fid[p];  // alias
-    for (std::map<int, int>::const_iterator it1 = track.begin();
-         it1 != track.end() ; it1++) {
-      for (std::map<int, int>::const_iterator it2 = it1;
-           it2 != track.end() ; it2++) {
-        if (it1->first != it2->first) {
-          // Never match an image with itself
-          sparse_map->cid_to_cid_[it1->first].insert(it2->first);
-        }
-      }
-    }
-  }
-
-  sparse_mapping::MatchFeatures(sparse_mapping::EssentialFile(map_file),
-                                sparse_mapping::MatchesFile(map_file), sparse_map.get());
-  for (size_t i = 0; i < world_to_ref_t.size(); i++)
-    sparse_map->SetFrameGlobalTransform(i, world_to_ref_t[i]);
-
-  // Wipe file that is no longer needed
-  try {
-    std::remove(sparse_mapping::EssentialFile(map_file).c_str());
-  }catch(...) {}
-
-  std::cout << "Building tracks.";
-  bool rm_invalid_xyz = true;  // by now cameras are good, so filter out bad stuff
-  sparse_mapping::BuildTracks(rm_invalid_xyz,
-                              sparse_mapping::MatchesFile(map_file),
-                              sparse_map.get());
-
-  // It is essential that during re-building we do not vary the
-  // cameras. Those were usually computed with a lot of SURF features,
-  // while rebuilding is usually done with many fewer ORGBRISK
-  // features.
-  bool fix_cameras = true;
-  if (fix_cameras)
-    std::cout << "Performing bundle adjustment with fixed cameras.";
-  else
-    std::cout << "Performing bundle adjustment while floating cameras.";
-
-  sparse_mapping::BundleAdjust(fix_cameras, sparse_map.get());
 }
 
 // Compute the transforms from the world to every camera, using pose interpolation
@@ -1048,6 +966,8 @@ void setMapValue(std::vector<std::map<int, std::map<int, int>>> & pid_cid_fid,
 }
 
 void parameterValidation() {
+#if HAVE_ASTROBEE
+
   if (FLAGS_ros_bag.empty())
     LOG(FATAL) << "The bag file was not specified.";
   if (FLAGS_sparse_map.empty())
@@ -1055,6 +975,8 @@ void parameterValidation() {
 
   if (FLAGS_output_map.empty())
     LOG(FATAL) << "The output sparse map was not specified.";
+
+#endif
 
   if (FLAGS_robust_threshold <= 0.0)
     LOG(FATAL) << "The robust threshold must be positive.\n";
@@ -1081,18 +1003,6 @@ void parameterValidation() {
   if (FLAGS_nav_cam_num_exclude_boundary_pixels < 0)
     LOG(FATAL) << "Must have a non-negative value for --nav_cam_num_exclude_boundary_pixels.\n";
 
-  if (FLAGS_nav_cam_distortion_replacement != "") {
-    if (FLAGS_haz_cam_intrinsics_to_float != "" ||
-        FLAGS_sci_cam_intrinsics_to_float != "" ||
-        FLAGS_extrinsics_to_float != ""         ||
-        FLAGS_float_sparse_map                  ||
-        FLAGS_float_scale                       ||
-        FLAGS_float_timestamp_offsets)
-      LOG(FATAL) << "If replacing and optimizing the nav_cam model distortion, the rest "
-        "of the variables must be kept fixed. Once this model is found and saved, "
-        "a subsequent call to this tool may do various co-optimizations.";
-  }
-
   if (FLAGS_registration && (FLAGS_xyz_file.empty() || FLAGS_hugin_file.empty()))
     LOG(FATAL) << "In order to register the map, the hugin and xyz file must be specified.";
 
@@ -1111,6 +1021,14 @@ void parameterValidation() {
 
   if (FLAGS_save_matches && FLAGS_out_dir == "")
     LOG(FATAL) << "Cannot save matches if no output directory was provided.\n";
+
+#if !HAVE_ASTROBEE
+  if (FLAGS_rig_config == "")
+    LOG(FATAL) << "Must specify the initial rig configuration via --rig_config.\n";
+
+  if (FLAGS_image_list == "")
+    LOG(FATAL) << "Must specify the image list via --image_list.\n";
+#endif
 
   return;
 }
@@ -1228,13 +1146,13 @@ void lookupImagesAndBrackets(  // Inputs
         // This has to succeed since this timestamp originally came from the bag
         bool have_lookup = false;
         if (!image_data.empty())
-          have_lookup =  // read from images saved on disk
+          have_lookup =  // Read from images/depth clouds stored in files
             dense_map::lookupImage(cam.timestamp, image_data[cam_type], cam.image,
                                    image_start_positions[cam_type],  // this will move forward
                                    found_time);
 
         else
-          have_lookup =  // read from bag
+          have_lookup =  // Read from bag
             dense_map::lookupImage(cam.timestamp, mapVal(bag_map, image_topics[cam_type]),
                                    save_grayscale,
                                    // outputs
@@ -1291,14 +1209,14 @@ void lookupImagesAndBrackets(  // Inputs
           cv::Mat image;
           bool have_lookup = false;
           if (!image_data.empty())
-            have_lookup =  // read from images saved on disk
+            have_lookup =  // Read from images/depth clouds stored in files
               dense_map::lookupImage(curr_timestamp, image_data[cam_type], image,
                                      // care here, start_pos moves forward
                                      start_pos,
                                      // found_time will be updated now
                                      found_time);
           else
-            have_lookup =                             // read from bag
+            have_lookup =                             // Read from bag
               dense_map::lookupImage(curr_timestamp,  // start looking from here
                                      mapVal(bag_map, image_topics[cam_type]), save_grayscale,
                                      // outputs
@@ -1371,26 +1289,24 @@ void lookupImagesAndBrackets(  // Inputs
           = std::min(max_timestamp_offset[cam_type], cam.timestamp - ref_timestamps[beg_ref_it]);
       }
 
-      if (depth_topics[cam_type] != "") {
-        cam.cloud_timestamp = -1.0;  // will change
-        // Look up the closest cloud in time (either before or after cam.timestamp)
-        // This need not succeed.
-        if (!depth_data.empty())
-          dense_map::lookupImage(cam.timestamp,  // start looking from this time forward
-                                 depth_data[cam_type],
-                                 // Outputs
-                                 cam.depth_cloud,
-                                 cloud_start_positions[cam_type],  // this will move forward
-                                 cam.cloud_timestamp);             // found time
-        else
-          dense_map::lookupCloud(cam.timestamp,  // start looking from this time forward
-                                 mapVal(bag_map, depth_topics[cam_type]),
-                                 max_haz_cam_image_to_depth_timestamp_diff,
-                                 // Outputs
-                                 cam.depth_cloud,
-                                 cloud_start_positions[cam_type],  // this will move forward
-                                 cam.cloud_timestamp);             // found time
-      }
+      // Look up the closest cloud in time (either before or after cam.timestamp)
+      // This need not succeed.
+      cam.cloud_timestamp = -1.0;  // will change
+      if (!depth_data.empty())     // Read from images/depth clouds stored in files
+        dense_map::lookupImage(cam.timestamp,  // start looking from this time forward
+                               depth_data[cam_type],
+                               // Outputs
+                               cam.depth_cloud,
+                               cloud_start_positions[cam_type],  // this will move forward
+                               cam.cloud_timestamp);             // found time
+      else if (depth_topics[cam_type] != "")                     // Read from bag
+        dense_map::lookupCloud(cam.timestamp,  // start looking from this time forward
+                               mapVal(bag_map, depth_topics[cam_type]),
+                               max_haz_cam_image_to_depth_timestamp_diff,
+                               // Outputs
+                               cam.depth_cloud,
+                               cloud_start_positions[cam_type],  // this will move forward
+                               cam.cloud_timestamp);             // found time
 
       cams.push_back(cam);
     }  // end loop over camera types
@@ -1436,6 +1352,7 @@ void lookupImagesAndBrackets(  // Inputs
   }
 }
 
+// TODO(oalexan1): Move to utils
 void multiViewTriangulation(  // Inputs
   std::vector<camera::CameraParameters> const& cam_params,
   std::vector<dense_map::cameraImage> const& cams, std::vector<Eigen::Affine3d> const& world_to_cam,
@@ -1491,6 +1408,7 @@ void multiViewTriangulation(  // Inputs
   return;
 }
 
+// TODO(oalexan1): Move to utils
 void meshTriangulations(  // Inputs
   std::vector<camera::CameraParameters> const& cam_params,
   std::vector<dense_map::cameraImage> const& cams, std::vector<Eigen::Affine3d> const& world_to_cam,
@@ -1572,12 +1490,11 @@ void flagOutlierByExclusionDist(  // Inputs
       // Initially there are inliers only
       pid_cid_fid_inlier[pid][cid][fid] = 1;
 
-      Eigen::Vector2d dist_ip(keypoint_vec[cid][fid].first, keypoint_vec[cid][fid].second);
-
       if (cams[cid].camera_type == ref_cam_type) {
         // Flag as outliers pixels at the nav_cam boundary, if desired. This
         // is especially important when the nav_cam uses the radtan
         // model instead of fisheye.
+        Eigen::Vector2d dist_ip(keypoint_vec[cid][fid].first, keypoint_vec[cid][fid].second);
         Eigen::Vector2i dist_size = cam_params[cams[cid].camera_type].GetDistortedSize();
         int excl = nav_cam_num_exclude_boundary_pixels;
         if (dist_ip.x() < excl || dist_ip.x() > dist_size[0] - 1 - excl ||
@@ -1808,6 +1725,7 @@ std::string affineToStr(Eigen::Affine3d const& M) {
   return os.str();
 }
 
+// TODO(oalexan1): Move to utils
 // Form an affine transform from 12 values
 Eigen::Affine3d vecToAffine(Eigen::VectorXd const& vals) {
   if (vals.size() != 12)
@@ -1874,14 +1792,17 @@ void writeImageList(std::string const& out_dir, std::vector<dense_map::cameraIma
   f.close();
 }
 
+// TODO(oalexan1): Move to utils
 // Read the images, depth clouds, and their metadata
-void readImageAndDepthData(std::string const& image_list_file, int ref_cam_type,
-                           std::vector<double>& ref_timestamps,
-                           std::vector<Eigen::Affine3d>& world_to_cam,
-                           std::vector<std::vector<ImageMessage>>& image_data,
-                           std::vector<std::vector<ImageMessage>>& depth_data) {
+void readImageAndDepthData(  // Inputs
+  std::string const& image_list_file, int ref_cam_type,
+  // Outputs
+  std::vector<double>& ref_timestamps, std::vector<Eigen::Affine3d>& world_to_ref,
+  std::vector<std::vector<ImageMessage>>& image_data,
+  std::vector<std::vector<ImageMessage>>& depth_data) {
+  // Clear the outputs
   ref_timestamps.clear();
-  world_to_cam.clear();
+  world_to_ref.clear();
   image_data.clear();
   depth_data.clear();
 
@@ -1909,31 +1830,6 @@ void readImageAndDepthData(std::string const& image_list_file, int ref_cam_type,
 
     if (cam_type < 0) LOG(FATAL) << "The sensor id must be non-negative.\n";
 
-    if (cam_type == ref_cam_type)
-      ref_timestamps.push_back(timestamp);
-
-    // Create aliases
-    std::map<double, ImageMessage> & image_map = image_maps[cam_type];
-    std::map<double, ImageMessage> & depth_map = depth_maps[cam_type];
-
-    if (image_map.find(timestamp) != image_map.end())
-      LOG(FATAL) << "Duplicate timestamp " << std::setprecision(17) << timestamp
-                 << " for sensor id " << cam_type << "\n";
-    // Read the image exactly as written, which would be grayscale
-    image_map[timestamp].image = cv::imread(image_file, cv::IMREAD_UNCHANGED);
-    image_map[timestamp].name = image_file;
-    image_map[timestamp].timestamp = timestamp;
-
-    if (depth_map.find(timestamp) != depth_map.end())
-      LOG(FATAL) << "Duplicate timestamp " << std::setprecision(17) << timestamp
-                 << " for sensor id " << cam_type << "\n";
-
-    if (depth_file != dense_map::NO_DEPTH_FILE) {
-      dense_map::readXyzImage(depth_file, depth_map[timestamp].image);
-      depth_map[timestamp].name = depth_file;
-      depth_map[timestamp].timestamp = timestamp;
-    }
-
     // Read the camera to world transform
     Eigen::VectorXd vals(12);
     double val = -1.0;
@@ -1943,11 +1839,37 @@ void readImageAndDepthData(std::string const& image_list_file, int ref_cam_type,
       vals[count] = val;
       count++;
     }
+
     if (count != 12)
       LOG(FATAL) << "Expecting 12 values for the transform on line:\n" << line << "\n";
 
-    Eigen::Affine3d M = vecToAffine(vals);
-    world_to_cam.push_back(M);
+    Eigen::Affine3d world_to_cam = vecToAffine(vals);
+
+    // Create aliases
+    std::map<double, ImageMessage> & image_map = image_maps[cam_type];
+    std::map<double, ImageMessage> & depth_map = depth_maps[cam_type];
+
+    if (image_map.find(timestamp) != image_map.end())
+      LOG(FATAL) << "Duplicate timestamp " << std::setprecision(17) << timestamp
+                 << " for sensor id " << cam_type << "\n";
+
+    // Read the image exactly as written, which would be grayscale
+    image_map[timestamp].image        = cv::imread(image_file, cv::IMREAD_UNCHANGED);
+    image_map[timestamp].name         = image_file;
+    image_map[timestamp].timestamp    = timestamp;
+    image_map[timestamp].world_to_cam = world_to_cam;
+
+    // Sanity check
+    if (depth_map.find(timestamp) != depth_map.end())
+      LOG(FATAL) << "Duplicate timestamp " << std::setprecision(17) << timestamp
+                 << " for sensor id " << cam_type << "\n";
+
+    // Read the depth data, if present
+    if (depth_file != dense_map::NO_DEPTH_FILE) {
+      dense_map::readXyzImage(depth_file, depth_map[timestamp].image);
+      depth_map[timestamp].name      = depth_file;
+      depth_map[timestamp].timestamp = timestamp;
+    }
   }
 
   // Find the range of sensor ids.
@@ -1964,18 +1886,23 @@ void readImageAndDepthData(std::string const& image_list_file, int ref_cam_type,
   for (size_t cam_type = 0; cam_type < image_data.size(); cam_type++) {
     std::map<double, ImageMessage> & image_map = image_maps[cam_type];
     std::map<double, ImageMessage> & depth_map = depth_maps[cam_type];
+
     for (auto it = image_map.begin(); it != image_map.end(); it++) {
       image_data[cam_type].push_back(it->second);
+
+      // Collect the ref cam timestamps and world_to_ref as well
+      if (cam_type == ref_cam_type) {
+        world_to_ref.push_back(it->second.world_to_cam);
+        ref_timestamps.push_back(it->second.timestamp);
+      }
     }
-    for (auto it = depth_map.begin(); it != depth_map.end(); it++) {
+
+    for (auto it = depth_map.begin(); it != depth_map.end(); it++)
       depth_data[cam_type].push_back(it->second);
-    }
   }
 
   return;
 }
-
-// Must add cam_names
 
 // Save the optimized rig configuration
 void writeRigConfig(std::string const& out_dir, bool model_rig, int ref_cam_type,
@@ -2054,6 +1981,8 @@ void writeRigConfig(std::string const& out_dir, bool model_rig, int ref_cam_type
   f.close();
 }
 
+// TODO(oalexan1): Move to utils
+
 // Read real values after given tag. Ignore comments, so any line starting
 // with #, and empty lines. If desired_num_vals >=0, validate that we
 // read the desired number.
@@ -2090,6 +2019,7 @@ void readConfigVals(std::ifstream & f, std::string const& tag, int desired_num_v
   throw std::runtime_error("Could not read value for: " + tag);
 }
 
+// TODO(oalexan1): Move to utils
 // Read strings separated by spaces after given tag. Ignore comments, so any line starting
 // with #, and empty lines. If desired_num_vals >=0, validate that we
 // read the desired number.
@@ -2120,6 +2050,8 @@ void readConfigVals(std::ifstream & f, std::string const& tag, int desired_num_v
   throw std::runtime_error("Could not read value for: " + tag);
 }
 
+// TODO(oalexan1): Move to utils
+
 // Read a rig configuration. Check if the transforms among the sensors
 // on the rig is not 0, in that case will use it.
 void readRigConfig(std::string const& rig_config, bool & have_rig_transforms, int & ref_cam_type,
@@ -2128,102 +2060,107 @@ void readRigConfig(std::string const& rig_config, bool & have_rig_transforms, in
                    std::vector<Eigen::Affine3d> & ref_to_cam_trans,
                    std::vector<Eigen::Affine3d> & depth_to_image,
                    std::vector<double> & ref_to_cam_timestamp_offsets) {
-  // Initialize the outputs
-  have_rig_transforms = true;
-  ref_cam_type = 0;
-  cam_names.clear();
-  cam_params.clear();
-  ref_to_cam_trans.clear();
-  depth_to_image.clear();
-  ref_to_cam_timestamp_offsets.clear();
+  try {
+    // Initialize the outputs
+    have_rig_transforms = true;
+    ref_cam_type = 0;
+    cam_names.clear();
+    cam_params.clear();
+    ref_to_cam_trans.clear();
+    depth_to_image.clear();
+    ref_to_cam_timestamp_offsets.clear();
 
-  // Open the file
-  std::cout << "Reading: " << rig_config << std::endl;
-  std::ifstream f;
-  f.open(rig_config.c_str(), std::ios::binary | std::ios::in);
-  if (!f.is_open()) LOG(FATAL) << "Cannot open file for reading: " << rig_config << "\n";
+    // Open the file
+    std::cout << "Reading: " << rig_config << std::endl;
+    std::ifstream f;
+    f.open(rig_config.c_str(), std::ios::binary | std::ios::in);
+    if (!f.is_open()) LOG(FATAL) << "Cannot open file for reading: " << rig_config << "\n";
 
-  // Read the ref sensor id
-  Eigen::VectorXd vals;
-  std::vector<std::string> str_vals;
+    // Read the ref sensor id
+    Eigen::VectorXd vals;
+    std::vector<std::string> str_vals;
 
-  readConfigVals(f, "ref_sensor_id:", 1, vals);
-  ref_cam_type = vals[0];
-  if (ref_cam_type != 0) LOG(FATAL) << "The reference sensor id must be 0.\n";
+    readConfigVals(f, "ref_sensor_id:", 1, vals);
+    ref_cam_type = vals[0];
+    if (ref_cam_type != 0) LOG(FATAL) << "The reference sensor id must be 0.\n";
 
-  // Read each sensor
-  int sensor_it = -1;
-  while (1) {
-    sensor_it++;
+    // Read each sensor
+    int sensor_it = -1;
+    while (1) {
+      sensor_it++;
 
-    try {
-      readConfigVals(f, "sensor_id:", 1, vals);
-    } catch(...) {
-      // Likely no more sensors
-      return;
+      try {
+        readConfigVals(f, "sensor_id:", 1, vals);
+      } catch(...) {
+        // Likely no more sensors
+        return;
+      }
+      int sensor_id = vals[0];
+      if (sensor_id != sensor_it) LOG(FATAL) << "Expecting to read sensor id: "
+                                             << sensor_it << "\n";
+
+      readConfigVals(f, "sensor_name:", 1, str_vals);
+      std::string sensor_name = str_vals[0];
+      cam_names.push_back(sensor_name);
+
+      readConfigVals(f, "focal_length:", 1, vals);
+      Eigen::Vector2d focal_length(vals[0], vals[0]);
+
+      readConfigVals(f, "optical_center:", 2, vals);
+      Eigen::Vector2d optical_center(vals[0], vals[1]);
+
+      readConfigVals(f, "distortion_coeffs:", -1, vals);
+      if (vals.size() != 0 && vals.size() != 1 && vals.size() != 4 && vals.size() != 5)
+        LOG(FATAL) << "Expecting 0, 1, 4, or 5 distortion coefficients.\n";
+      Eigen::VectorXd distortion = vals;
+
+      readConfigVals(f, "distortion_type:", 1, str_vals);
+      if (distortion.size() == 0 && str_vals[0] != dense_map::NO_DISTORION)
+        LOG(FATAL) << "When there are no distortion coefficients, distortion type must be: "
+                   << dense_map::NO_DISTORION << "\n";
+      if (distortion.size() == 1 && str_vals[0] != dense_map::FISHEYE_DISTORTION)
+        LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
+                   << dense_map::FISHEYE_DISTORTION << "\n";
+      if ((distortion.size() == 4 || distortion.size() == 5) &&
+          str_vals[0] != dense_map::RADTAN_DISTORTION)
+        LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
+                   << dense_map::RADTAN_DISTORTION << "\n";
+
+      readConfigVals(f, "image_size:", 2, vals);
+      Eigen::Vector2i image_size(vals[0], vals[1]);
+
+      readConfigVals(f, "undistorted_image_size:", 2, vals);
+      Eigen::Vector2i undistorted_image_size(vals[0], vals[1]);
+
+      camera::CameraParameters params(image_size, focal_length, optical_center, distortion);
+      params.SetUndistortedSize(undistorted_image_size);
+      cam_params.push_back(params);
+
+      readConfigVals(f, "ref_to_sensor_transform:", 12, vals);
+      ref_to_cam_trans.push_back(vecToAffine(vals));
+
+      // Sanity check
+      if (have_rig_transforms &&
+          ref_to_cam_trans.back().matrix() == 0 * ref_to_cam_trans.back().matrix()) {
+        std::cout << "Found that ref_to_sensor_transform is zero. Will ignore it." << std::endl;
+        have_rig_transforms = false;
+      }
+
+      readConfigVals(f, "depth_to_image_transform:", 12, vals);
+      depth_to_image.push_back(vecToAffine(vals));
+
+      readConfigVals(f, "ref_to_sensor_timestamp_offset:", 1, vals);
+      double timestamp_offset = vals[0];
+      ref_to_cam_timestamp_offsets.push_back(timestamp_offset);
     }
-    int sensor_id = vals[0];
-    if (sensor_id != sensor_it) LOG(FATAL) << "Expecting to read sensor id: " << sensor_it << "\n";
-
-    readConfigVals(f, "sensor_name:", 1, str_vals);
-    std::string sensor_name = str_vals[0];
-    cam_names.push_back(sensor_name);
-
-    readConfigVals(f, "focal_length:", 1, vals);
-    Eigen::Vector2d focal_length(vals[0], vals[0]);
-
-    readConfigVals(f, "optical_center:", 2, vals);
-    Eigen::Vector2d optical_center(vals[0], vals[1]);
-
-    readConfigVals(f, "distortion_coeffs:", -1, vals);
-    if (vals.size() != 0 && vals.size() != 1 && vals.size() != 4 && vals.size() != 5)
-      LOG(FATAL) << "Expecting 0, 1, 4, or 5 distortion coefficients.\n";
-    Eigen::VectorXd distortion = vals;
-
-    readConfigVals(f, "distortion_type:", 1, str_vals);
-    if (distortion.size() == 0 && str_vals[0] != dense_map::NO_DISTORION)
-      LOG(FATAL) << "When there are no distortion coefficients, distortion type must be: "
-                 << dense_map::NO_DISTORION << "\n";
-    if (distortion.size() == 1 && str_vals[0] != dense_map::FISHEYE_DISTORTION)
-      LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
-                 << dense_map::FISHEYE_DISTORTION << "\n";
-    if ((distortion.size() == 4 || distortion.size() == 5) &&
-        str_vals[0] != dense_map::RADTAN_DISTORTION)
-      LOG(FATAL) << "When there is 1 distortion coefficient, distortion type must be: "
-                 << dense_map::RADTAN_DISTORTION << "\n";
-
-    readConfigVals(f, "image_size:", 2, vals);
-    Eigen::Vector2i image_size(vals[0], vals[1]);
-
-    readConfigVals(f, "undistorted_image_size:", 2, vals);
-    Eigen::Vector2i undistorted_image_size(vals[0], vals[1]);
-
-    camera::CameraParameters params(image_size, focal_length, optical_center, distortion);
-    params.SetUndistortedSize(undistorted_image_size);
-    cam_params.push_back(params);
-
-    readConfigVals(f, "ref_to_sensor_transform:", 12, vals);
-    ref_to_cam_trans.push_back(vecToAffine(vals));
 
     // Sanity check
-    if (have_rig_transforms &&
-        ref_to_cam_trans.back().matrix() == 0 * ref_to_cam_trans.back().matrix()) {
-      std::cout << "Found that ref_to_sensor_transform is zero. Will ignore it." << std::endl;
-      have_rig_transforms = false;
+    if (have_rig_transforms) {
+      if (ref_to_cam_trans[0].matrix() != Eigen::Affine3d::Identity().matrix())
+        LOG(FATAL) << "The transform from the reference sensor to itself must be the identity.\n";
     }
-
-    readConfigVals(f, "depth_to_image_transform:", 12, vals);
-    depth_to_image.push_back(vecToAffine(vals));
-
-    readConfigVals(f, "ref_to_sensor_timestamp_offset:", 1, vals);
-    double timestamp_offset = vals[0];
-    ref_to_cam_timestamp_offsets.push_back(timestamp_offset);
-  }
-
-  // Sanity check
-  if (have_rig_transforms) {
-    if (ref_to_cam_trans[0].matrix() != Eigen::Affine3d::Identity().matrix())
-      LOG(FATAL) << "The transform from the reference sensor to itself must be the identity.\n";
+  } catch(std::exception const& e) {
+    LOG(FATAL) << e.what() << "\n";
   }
 
   return;
@@ -2232,44 +2169,43 @@ void readRigConfig(std::string const& rig_config, bool & have_rig_transforms, in
 }  // namespace dense_map
 
 int main(int argc, char** argv) {
+#if HAVE_ASTROBEE
   ff_common::InitFreeFlyerApplication(&argc, &argv);
   GOOGLE_PROTOBUF_VERIFY_VERSION;
+#else
+  google::InitGoogleLogging(argv[0]);
+  google::ParseCommandLineFlags(&argc, &argv, true);
+#endif
+
+  std::cout << "--rig config " << FLAGS_rig_config << std::endl;
 
   dense_map::parameterValidation();
 
-  // The info below will eventually come from a file
-  int num_cam_types = 3;
-  int ref_cam_type = 0;  // Below we assume the starting cam is the ref cam
-  int haz_cam_type = 1;
+  // We assume that the first cam is the ref cam (its id is 0)
+  int ref_cam_type = 0;
 
-  // Image and depth topics
-  std::vector<std::string> cam_names    = {"nav_cam", "haz_cam", "sci_cam"};
-  std::vector<std::string> image_topics = {"/mgt/img_sampler/nav_cam/image_record",
-                                           "/hw/depth_haz/extended/amplitude_int",
-                                           "/hw/cam_sci/compressed"};
-  std::vector<std::string> depth_topics = {"", "/hw/depth_haz/points", ""};
-
-  // Read the calibration so far
+  // Image names
+  std::vector<std::string> cam_names;
+  std::vector<Eigen::Affine3d> depth_to_image;
   std::vector<camera::CameraParameters> cam_params;
   std::vector<Eigen::Affine3d>          ref_to_cam_trans;
   std::vector<double>                   ref_to_cam_timestamp_offsets;
-  Eigen::Affine3d                       nav_cam_to_body_trans;
-  Eigen::Affine3d                       haz_cam_depth_to_image_transform;
-  dense_map::readConfigFile(  // Inputs
-    cam_names, "nav_cam_transform", "haz_cam_depth_to_image_transform",
-    // Outputs
-    cam_params, ref_to_cam_trans, ref_to_cam_timestamp_offsets, nav_cam_to_body_trans,
-    haz_cam_depth_to_image_transform);
-  std::vector<camera::CameraParameters> orig_cam_params = cam_params;
 
-  // Adjust the undistortion region consistently with the distortion
-  // region adjustment (but note that the undistortion size is a big
-  // overestimate to start with).
-  if (FLAGS_nav_cam_num_exclude_boundary_pixels > 0) {
-    int L = FLAGS_nav_cam_num_exclude_boundary_pixels;
-    Eigen::Vector2i undist_size = cam_params[ref_cam_type].GetUndistortedSize();
-    cam_params[ref_cam_type].SetUndistortedSize(undist_size - Eigen::Vector2i(2*L, 2*L));
-  }
+  bool have_rig_transforms = false;
+  if (FLAGS_rig_config != "")  // Read a plain text config file for n sensors
+    dense_map::readRigConfig(FLAGS_rig_config, have_rig_transforms, ref_cam_type, cam_names,
+                             cam_params, ref_to_cam_trans, depth_to_image,
+                             ref_to_cam_timestamp_offsets);
+  else  // Read a lua-based config file for an Astrobee robot with 3 sensors
+    dense_map::readLuaConfig(have_rig_transforms, ref_cam_type, cam_names, cam_params,
+                             ref_to_cam_trans, depth_to_image, ref_to_cam_timestamp_offsets);
+
+  // This is needed to make the tool reading a rig config file agree
+  // with it reading a lua config file
+  // double f = cam_params[ref_cam_type].GetFocalLength();
+  // cam_params[ref_cam_type].SetFocalLength(Eigen::Vector2d(f, f));
+
+  int num_cam_types = cam_params.size();
 
   // Optionally override the timestamp offset
   if (!std::isnan(FLAGS_nav_cam_to_sci_cam_offset_override_value)) {
@@ -2283,13 +2219,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Optionally load the mesh
-  mve::TriangleMesh::Ptr mesh;
-  std::shared_ptr<mve::MeshInfo> mesh_info;
-  std::shared_ptr<tex::Graph> graph;
-  std::shared_ptr<BVHTree> bvh_tree;
-  if (FLAGS_mesh != "") dense_map::loadMeshBuildTree(FLAGS_mesh, mesh, mesh_info, graph, bvh_tree);
-
   // If desired to process only specific timestamps
   std::set<double> sci_cam_timestamps_to_use;
   if (FLAGS_sci_cam_timestamps != "") {
@@ -2298,57 +2227,58 @@ int main(int argc, char** argv) {
     while (ifs >> val) sci_cam_timestamps_to_use.insert(val);
   }
 
-  // Separate the initial scale. This is convenient if
-  // haz_cam_depth_to_image is scale * rotation + translation and if
-  // it is desired to keep the scale fixed. In either case, the scale
-  // will be multiplied back when needed.
-  double haz_cam_depth_to_image_scale
-    = pow(haz_cam_depth_to_image_transform.matrix().determinant(), 1.0 / 3.0);
-  Eigen::Affine3d haz_cam_normalized_depth_to_image = haz_cam_depth_to_image_transform;
-  haz_cam_normalized_depth_to_image.linear() /= haz_cam_depth_to_image_scale;
+  // Save this in case we need to restore the original parameters
+  std::vector<camera::CameraParameters> orig_cam_params = cam_params;
 
+  // Optionally load the mesh
+  mve::TriangleMesh::Ptr mesh;
+  std::shared_ptr<mve::MeshInfo> mesh_info;
+  std::shared_ptr<tex::Graph> graph;
+  std::shared_ptr<BVHTree> bvh_tree;
+  if (FLAGS_mesh != "") dense_map::loadMeshBuildTree(FLAGS_mesh, mesh, mesh_info, graph, bvh_tree);
+
+  // world_to_ref has the transforms from the ref cameras to the world,
+  // while world_to_cam has the transforms from the world to all cameras,
+  // including world_to_ref. Both of these are needed in certain circumstances,
+  // and it is very important to always keep these in sync.
+  std::vector<Eigen::Affine3d> world_to_ref, world_to_cam;
+
+  // The timestamp for the ref camera.
+  std::vector<double> ref_timestamps;
+
+#if HAVE_ASTROBEE
   // Read the sparse map. It has the ref cam poses.
   boost::shared_ptr<sparse_mapping::SparseMap> sparse_map =
     boost::shared_ptr<sparse_mapping::SparseMap>(new sparse_mapping::SparseMap(FLAGS_sparse_map));
 
-  // Optionally deal with using a non-FOV model for nav_cam
-  Eigen::VectorXd nav_cam_distortion_replacement;
-  if (FLAGS_nav_cam_distortion_replacement != "") {
-    std::vector<double> vec = dense_map::string_to_vector(FLAGS_nav_cam_distortion_replacement);
-    if (vec.size() != 5)
-      LOG(FATAL) << "nav_cam distortion replacement must consist of 5 values, corresponding"
-                 << "to radial and tangential distortion coefficients. Using only 4 values "
-                 << "was shown to work poorly.\n";
-    nav_cam_distortion_replacement
-      = Eigen::Map<Eigen::VectorXd, Eigen::Unaligned>(vec.data(), vec.size());
-  }
-
-  // Parse the ref timestamps from the sparse map. We assume the
-  // sparse map image names are the timestamps.
-  std::vector<double> ref_timestamps;
+  // Parse the ref timestamps from the sparse map. We assume that the
+  // map image names are the timestamps.
   const std::vector<std::string>& sparse_map_images = sparse_map->cid_to_filename_;
   ref_timestamps.resize(sparse_map_images.size());
   for (size_t cid = 0; cid < sparse_map_images.size(); cid++)
     ref_timestamps[cid] = dense_map::fileNameToTimestamp(sparse_map_images[cid]);
   if (ref_timestamps.empty()) LOG(FATAL) << "No sparse map timestamps found.";
 
-  // Will optimize the nav cam poses as part of the process
-  std::vector<Eigen::Affine3d> & world_to_ref_t = sparse_map->cid_to_cam_t_global_;  // alias
+  // Will optimize the ref cam poses as part of the process
+  // Make a copy of them here.
+  world_to_ref = sparse_map->cid_to_cam_t_global_;
+#endif
 
   std::vector<std::vector<dense_map::ImageMessage>> image_data;
   std::vector<std::vector<dense_map::ImageMessage>> depth_data;
-  std::vector<Eigen::Affine3d> world_to_cam;
   if (FLAGS_image_list != "")
-    dense_map::readImageAndDepthData(FLAGS_image_list, ref_cam_type, ref_timestamps,
-                                     world_to_cam, image_data, depth_data);
+    dense_map::readImageAndDepthData(  // Inputs
+      FLAGS_image_list, ref_cam_type,
+      // Outputs
+      ref_timestamps, world_to_ref, image_data, depth_data);
 
   // Put transforms of the reference cameras in a vector. We will optimize them.
-  int num_ref_cams = world_to_ref_t.size();
-  if (world_to_ref_t.size() != ref_timestamps.size())
+  int num_ref_cams = world_to_ref.size();
+  if (world_to_ref.size() != ref_timestamps.size())
     LOG(FATAL) << "Must have as many ref cam timestamps as ref cameras.\n";
   std::vector<double> world_to_ref_vec(num_ref_cams * dense_map::NUM_RIGID_PARAMS);
   for (int cid = 0; cid < num_ref_cams; cid++)
-    dense_map::rigid_transform_to_array(world_to_ref_t[cid],
+    dense_map::rigid_transform_to_array(world_to_ref[cid],
                                         &world_to_ref_vec[dense_map::NUM_RIGID_PARAMS * cid]);
 
   // Need the identity transform for when the cam is the ref cam, and
@@ -2357,7 +2287,7 @@ int main(int argc, char** argv) {
   std::vector<double> identity_vec(dense_map::NUM_RIGID_PARAMS);
   dense_map::rigid_transform_to_array(identity, &identity_vec[0]);
 
-  // Put all timestamps to use in a vector, in the nav_cam, haz_cam, sci_cam order
+  // Put all timestamps to use in a vector, in the same order as the cameras
   std::vector<std::set<double>> cam_timestamps_to_use = {std::set<double>(),
                                                          std::set<double>(),
                                                          sci_cam_timestamps_to_use};
@@ -2378,15 +2308,6 @@ int main(int argc, char** argv) {
     LOG(FATAL) << "Cannot float the scale of depth_to_image_transform unless this "
                << "this is allowed as part of --extrinsics_to_float.\n";
 
-  if (FLAGS_nav_cam_distortion_replacement != "") {
-    if (intrinsics_to_float[ref_cam_type].find("distortion")
-        == intrinsics_to_float[ref_cam_type].end() ||
-        intrinsics_to_float[ref_cam_type].size() != 1) {
-      LOG(FATAL) << "When --nav_cam_distortion_replacement is used, must float the nav cam "
-                 << "distortion and no other nav cam intrinsics.\n";
-    }
-  }
-
   // Put the extrinsics in arrays, so we can optimize them
   std::vector<double> ref_to_cam_vec(num_cam_types * dense_map::NUM_RIGID_PARAMS);
   for (int cam_type = 0; cam_type < num_cam_types; cam_type++)
@@ -2398,24 +2319,29 @@ int main(int argc, char** argv) {
   int num_depth_params = dense_map::NUM_RIGID_PARAMS;
   if (FLAGS_affine_depth_to_image) num_depth_params = dense_map::NUM_AFFINE_PARAMS;
 
-  // Depth to image transforms and scales
-  std::vector<Eigen::Affine3d> normalized_depth_to_image;
-  std::vector<double> depth_to_image_scales = {1.0, haz_cam_depth_to_image_scale, 1.0};
-  normalized_depth_to_image.push_back(Eigen::Affine3d::Identity());
-  normalized_depth_to_image.push_back(haz_cam_normalized_depth_to_image);
-  normalized_depth_to_image.push_back(Eigen::Affine3d::Identity());
+  // Separate the initial scale. This is convenient if
+  // cam_depth_to_image is scale * rotation + translation and if
+  // it is desired to keep the scale fixed. In either case, the scale
+  // will be multiplied back when needed.
+  std::vector<double> depth_to_image_scales;
+  for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
+    double depth_to_image_scale
+      = pow(depth_to_image[cam_type].matrix().determinant(), 1.0 / 3.0);
+    depth_to_image[cam_type].linear() /= depth_to_image_scale;
+    depth_to_image_scales.push_back(depth_to_image_scale);
+  }
 
   // Put depth_to_image arrays, so we can optimize them
-  std::vector<double> normalized_depth_to_image_vec(num_cam_types * num_depth_params);
+  std::vector<double> depth_to_image_vec(num_cam_types * num_depth_params);
   for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
     if (FLAGS_affine_depth_to_image)
       dense_map::affine_transform_to_array
-        (normalized_depth_to_image[cam_type],
-         &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+        (depth_to_image[cam_type],
+         &depth_to_image_vec[num_depth_params * cam_type]);
     else
       dense_map::rigid_transform_to_array
-        (normalized_depth_to_image[cam_type],
-         &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+        (depth_to_image[cam_type],
+         &depth_to_image_vec[num_depth_params * cam_type]);
   }
 
   // Put the intrinsics in arrays
@@ -2432,9 +2358,16 @@ int main(int argc, char** argv) {
   }
 
   // Build a map for quick access for all the messages we may need
-  // TODO(oalexan1): Must the view be kept open for this to work?
-  std::cout << "Reading the bag: " << FLAGS_ros_bag << std::endl;
   std::vector<std::string> topics;
+  dense_map::StrToMsgMap bag_map;
+  std::vector<std::string> image_topics, depth_topics;
+#if HAVE_ASTROBEE
+  image_topics = {FLAGS_nav_cam_topic,
+                  FLAGS_haz_cam_intensity_topic,
+                  FLAGS_sci_cam_topic};
+  depth_topics = {"", FLAGS_haz_cam_points_topic, ""};
+
+  std::cout << "Reading the bag: " << FLAGS_ros_bag << std::endl;
   for (auto it = 0; it < image_topics.size(); it++)
     if (image_topics[it] != "") topics.push_back(image_topics[it]);
   for (auto it = 0; it < depth_topics.size(); it++)
@@ -2442,8 +2375,8 @@ int main(int argc, char** argv) {
   rosbag::Bag bag;
   bag.open(FLAGS_ros_bag, rosbag::bagmode::Read);
   rosbag::View view(bag, rosbag::TopicQuery(topics));
-  dense_map::StrToMsgMap bag_map;
   dense_map::indexMessages(view, bag_map);
+#endif
 
   // Keep here the images, timestamps, and bracketing information
   std::vector<dense_map::cameraImage> cams;
@@ -2470,20 +2403,41 @@ int main(int argc, char** argv) {
     dense_map::adjustImageSize(cam_params[cams[it].camera_type], cams[it].image);
 
   // Sort by the timestamp in reference camera time. This is essential
-  // for matching each image to other images close in time.
+  // for matching each image to other images close in time. Note
+  // that this does not affect the book-keeping of beg_ref_index
+  // and end_ref_it in this vector because those indices point to
+  // world_to_ref and ref_timestamp, which do not change.
   std::sort(cams.begin(), cams.end(), dense_map::timestampLess);
 
-  // If not read so far, compute the transform from the world to every
-  // camera. It assumes that world_to_ref_vec and ref_to_cam_vec are
-  // up-to-date.  Use the version of calc_world_to_cam_transforms
+  // If we have initial rig transforms, compute the transform from the
+  // world to every camera based on the rig transforms and ref_to_cam
+  // transforms. It assumes that world_to_ref_vec and ref_to_cam_vec
+  // are up-to-date. Use the version of calc_world_to_cam_transforms
   // without world_to_cam_vec, on input which was not computed yet.
-  if (world_to_cam.empty())
+  if (have_rig_transforms) {
     dense_map::calc_world_to_cam_transforms(  // Inputs
                                cams, world_to_ref_vec, ref_timestamps, ref_to_cam_vec,
                                ref_to_cam_timestamp_offsets,
                                // Output
                                world_to_cam);
+  } else {
+    // TODO(oalexan1): Make this into a function
+    // These were read with the images
+    std::vector<int> start_pos(num_cam_types, 0);  // to help advance in time
+    world_to_cam.resize(cams.size());
+    for (size_t cam_it = 0; cam_it < cams.size(); cam_it++) {
+      int cam_type = cams[cam_it].camera_type;
+      for (size_t pos = start_pos[cam_type]; pos < image_data[cam_type].size(); pos++) {
+        // Count on the fact that image_data[cam_type] is sorted chronologically
+        if (cams[cam_it].timestamp == image_data[cam_type][pos].timestamp) {
+          world_to_cam[cam_it] = image_data[cam_type][pos].world_to_cam;
+          start_pos[cam_type] = pos;  // save for next time
+        }
+      }
+    }
+  }
 
+  // TODO(oalexan1): Eliminate world_to_cam, use only world_to_cam_vec
   // If using no extrinsics, each camera will float separately, using
   // world_to_cam as initial guesses. Use world_to_cam_vec as storage
   // for the camera poses to optimize.
@@ -2531,10 +2485,10 @@ int main(int argc, char** argv) {
   // inlier becomes an outlier, it never becomes an inlier again.
   std::vector<std::map<int, std::map<int, int>>> pid_cid_fid_inlier;
   dense_map::flagOutlierByExclusionDist(  // Inputs
-      ref_cam_type, FLAGS_nav_cam_num_exclude_boundary_pixels, cam_params, cams, pid_to_cid_fid,
-      keypoint_vec,
-      // Outputs
-      pid_cid_fid_inlier);
+    ref_cam_type, FLAGS_nav_cam_num_exclude_boundary_pixels, cam_params, cams, pid_to_cid_fid,
+    keypoint_vec,
+    // Outputs
+    pid_cid_fid_inlier);
 
   // Structures needed to intersect rays with the mesh
   std::vector<std::map<int, std::map<int, Eigen::Vector3d>>> pid_cid_fid_mesh_xyz;
@@ -2568,17 +2522,6 @@ int main(int argc, char** argv) {
         bvh_tree,
         // Outputs
         pid_cid_fid_mesh_xyz, pid_mesh_xyz);
-
-    if (pass == 0 && FLAGS_nav_cam_distortion_replacement != "") {
-      // At the first pass, right after triangulation is done with a
-      // given nav cam model, which presumably was pretty accurate,
-      // replace its distortion if desired, which we will then
-      // optimize.
-      std::cout << "Setting nav cam distortion to: " << nav_cam_distortion_replacement.transpose()
-                << ". Will proceed to optimize it.\n";
-      cam_params[ref_cam_type].SetDistortion(nav_cam_distortion_replacement);
-      distortions[ref_cam_type] = cam_params[ref_cam_type].GetDistortion();
-    }
 
     // For a given fid = pid_to_cid_fid[pid][cid],
     // the value pid_cid_fid_to_residual_index[pid][cid][fid] will be the index in the array
@@ -2680,12 +2623,6 @@ int main(int argc, char** argv) {
         if (intrinsics_to_float[cam_type].find("distortion") == intrinsics_to_float[cam_type].end())
           problem.SetParameterBlockConstant(&distortions[cam_type][0]);
 
-        // We are replacing the distortion, which we want to optimize,
-        // so for now keep xyz fixed at the current good value before
-        // the distortion replacement
-        if (pass == 0 && FLAGS_nav_cam_distortion_replacement != "")
-          problem.SetParameterBlockConstant(&xyz_vec[pid][0]);
-
         // When the camera is the ref type, the right bracketing
         // camera is just a placeholder which is not used, hence
         // should not be optimized. Same for the ref_to_cam_vec and
@@ -2751,7 +2688,7 @@ int main(int argc, char** argv) {
           problem.AddResidualBlock
             (bracketed_depth_cost_function, bracketed_depth_loss_function,
              beg_cam_ptr, end_cam_ptr, ref_to_cam_ptr,
-             &normalized_depth_to_image_vec[num_depth_params * cam_type],
+             &depth_to_image_vec[num_depth_params * cam_type],
              &depth_to_image_scales[cam_type],
              &xyz_vec[pid][0],
              &ref_to_cam_timestamp_offsets[cam_type]);
@@ -2759,14 +2696,14 @@ int main(int argc, char** argv) {
           // Note that above we already considered fixing some params.
           // We won't repeat that code here.
           // If we model an affine depth to image, fix its scale here,
-          // it will change anyway as part of normalized_depth_to_image_vec.
+          // it will change anyway as part of depth_to_image_vec.
           if (!FLAGS_float_scale || FLAGS_affine_depth_to_image) {
             problem.SetParameterBlockConstant(&depth_to_image_scales[cam_type]);
           }
 
           if (extrinsics_to_float.find(depth_to_image_name) == extrinsics_to_float.end()) {
             problem.SetParameterBlockConstant(
-              &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+              &depth_to_image_vec[num_depth_params * cam_type]);
           }
         }
 
@@ -2801,7 +2738,7 @@ int main(int argc, char** argv) {
           problem.AddResidualBlock
             (bracketed_depth_mesh_cost_function, bracketed_depth_mesh_loss_function,
              beg_cam_ptr, end_cam_ptr, ref_to_cam_ptr,
-             &normalized_depth_to_image_vec[num_depth_params * cam_type],
+             &depth_to_image_vec[num_depth_params * cam_type],
              &depth_to_image_scales[cam_type],
              &ref_to_cam_timestamp_offsets[cam_type]);
 
@@ -2813,7 +2750,7 @@ int main(int argc, char** argv) {
 
           if (extrinsics_to_float.find(depth_to_image_name) == extrinsics_to_float.end())
             problem.SetParameterBlockConstant
-              (&normalized_depth_to_image_vec[num_depth_params * cam_type]);
+              (&depth_to_image_vec[num_depth_params * cam_type]);
         }
       }  // end iterating over all cid for given pid
 
@@ -2868,20 +2805,20 @@ int main(int argc, char** argv) {
       // Copy back the reference transforms
       for (int cid = 0; cid < num_ref_cams; cid++)
         dense_map::array_to_rigid_transform
-          (world_to_ref_t[cid], &world_to_ref_vec[dense_map::NUM_RIGID_PARAMS * cid]);
+          (world_to_ref[cid], &world_to_ref_vec[dense_map::NUM_RIGID_PARAMS * cid]);
     } else {
       // Each camera floats individually. Update world_to_cam from optimized world_to_cam_vec.
       for (size_t cid = 0; cid < cams.size(); cid++) {
         dense_map::array_to_rigid_transform
           (world_to_cam[cid], &world_to_cam_vec[dense_map::NUM_RIGID_PARAMS * cid]);
-        // Update world_to_ref_t as well, as it is part of the sparse map
+        // Update world_to_ref as well, as it is part of the sparse map
         if (cams[cid].camera_type == ref_cam_type) {
           int ref_cid = cams[cid].beg_ref_index;
-          world_to_ref_t[ref_cid] = world_to_cam[cid];
-          // For consistency, also keep world_to_ref_vec correct, even
+          world_to_ref[ref_cid] = world_to_cam[cid];
+          // For consistency, also keep world_to_ref_vec updated, even
           // if it is not used in this case
           dense_map::rigid_transform_to_array
-            (world_to_ref_t[ref_cid], &world_to_ref_vec[dense_map::NUM_RIGID_PARAMS * ref_cid]);
+            (world_to_ref[ref_cid], &world_to_ref_vec[dense_map::NUM_RIGID_PARAMS * ref_cid]);
         }
       }
     }
@@ -2911,12 +2848,12 @@ int main(int argc, char** argv) {
     for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
       if (FLAGS_affine_depth_to_image)
         dense_map::array_to_affine_transform
-          (normalized_depth_to_image[cam_type],
-           &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+          (depth_to_image[cam_type],
+           &depth_to_image_vec[num_depth_params * cam_type]);
       else
         dense_map::array_to_rigid_transform(
-          normalized_depth_to_image[cam_type],
-          &normalized_depth_to_image_vec[num_depth_params * cam_type]);
+          depth_to_image[cam_type],
+          &depth_to_image_vec[num_depth_params * cam_type]);
     }
 
     // Evaluate the residuals after optimization
@@ -2937,9 +2874,17 @@ int main(int argc, char** argv) {
         pid_cid_fid_inlier);
   }  // End optimization passes
 
+  // Put back the scale in depth_to_image
+  for (int cam_type = 0; cam_type < num_cam_types; cam_type++)
+    depth_to_image[cam_type].linear() *= depth_to_image_scales[cam_type];
+
   if (FLAGS_save_matches)
     dense_map::saveInlinerMatchPairs(image_files, FLAGS_num_overlaps, pid_to_cid_fid,
                                      keypoint_vec, pid_cid_fid_inlier, FLAGS_out_dir);
+
+#if HAVE_ASTROBEE
+  // Copy back the optimized ref map poses
+  sparse_map->cid_to_cam_t_global_ = world_to_ref;
 
   bool map_changed = (FLAGS_num_iterations > 0 &&
                       (FLAGS_float_sparse_map || FLAGS_nav_cam_intrinsics_to_float != ""));
@@ -2948,7 +2893,9 @@ int main(int argc, char** argv) {
     std::cout << "Either the sparse map intrinsics or cameras got modified. "
               << "The map must be rebuilt." << std::endl;
     dense_map::RebuildMap(FLAGS_output_map,  // Will be used for temporary saving of aux data
-                          cam_params[ref_cam_type], sparse_map);
+                          cam_params[ref_cam_type],
+                          FLAGS_refiner_min_angle, FLAGS_verbose,
+                          sparse_map);
   }
 
   if (FLAGS_registration) {
@@ -2962,11 +2909,11 @@ int main(int argc, char** argv) {
 
     std::cout << "Registration resulted in a scale adjustment of: " << map_scale << ".\n";
     // We do not change depth_to_image_scales since multiplying the
-    // affine component of normalized_depth_to_image is enough.
+    // affine component of depth_to_image is enough.
     for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
       // This transform is affine, so both the linear and translation parts need a scale
-      normalized_depth_to_image[cam_type].linear() *= map_scale;
-      normalized_depth_to_image[cam_type].translation() *= map_scale;
+      depth_to_image[cam_type].linear() *= map_scale;
+      depth_to_image[cam_type].translation() *= map_scale;
       // This is a rotation + translation, so only the translation needs the scale
       ref_to_cam_trans[cam_type].translation() *= map_scale;
 
@@ -2986,25 +2933,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Fuse back normalized_depth_to_image and depth_to_image_scales
-  std::vector<Eigen::Affine3d> depth_to_image(num_cam_types);
-  for (int cam_type = 0; cam_type < num_cam_types; cam_type++) {
-    depth_to_image[cam_type] = normalized_depth_to_image[cam_type];
-    depth_to_image[cam_type].linear() *= depth_to_image_scales[cam_type];
-  }
-
-  // Update this for haz_cam
-  haz_cam_depth_to_image_scale = depth_to_image_scales[haz_cam_type];
-  haz_cam_depth_to_image_transform = depth_to_image[haz_cam_type];
-
-  // Update the config file
-  dense_map::updateConfigFile(cam_names, "haz_cam_depth_to_image_transform",
-                              cam_params, ref_to_cam_trans,
-                              ref_to_cam_timestamp_offsets,
-                              haz_cam_depth_to_image_transform);
-
   std::cout << "Writing: " << FLAGS_output_map << std::endl;
   sparse_map->Save(FLAGS_output_map);
+
+  // Update the config file
+  dense_map::writeLuaConfig(cam_names, cam_params, ref_to_cam_trans,
+                             ref_to_cam_timestamp_offsets,
+                             depth_to_image);
+#endif
 
   // Update the transforms from the world to every camera
   dense_map::calc_world_to_cam_transforms(  // Inputs
@@ -3023,7 +2959,8 @@ int main(int argc, char** argv) {
     // TODO(oalexan1): This call to calc_world_to_cam_transforms is likely not
     // necessary since world_to_cam has been updated by now.
     dense_map::meshProjectCameras(cam_names, cam_params, cams, world_to_cam, mesh, bvh_tree,
-                                  ref_cam_type, FLAGS_nav_cam_num_exclude_boundary_pixels,
+                                  ref_cam_type,
+                                  FLAGS_nav_cam_num_exclude_boundary_pixels,
                                   FLAGS_out_texture_dir);
   }
 
@@ -3034,21 +2971,7 @@ int main(int argc, char** argv) {
     dense_map::writeRigConfig(FLAGS_out_dir, model_rig, ref_cam_type, cam_names,
                               cam_params, ref_to_cam_trans, depth_to_image,
                               ref_to_cam_timestamp_offsets);
-
-    // Temporary test code
-    //     std::string rig_config = FLAGS_out_dir + "/rig_config.txt";
-    //     bool have_rig_transforms = false;
-    //     try {
-    //       dense_map::readRigConfig(rig_config, have_rig_transforms, ref_cam_type, cam_names,
-    //                                cam_params, ref_to_cam_trans, depth_to_image,
-    //                                ref_to_cam_timestamp_offsets);
-    //     } catch(std::exception const& e) {
-    //       LOG(FATAL) << e.what() << "\n";
-    //     }
-
-    //     dense_map::writeRigConfig("tmp3", model_rig, ref_cam_type,  cam_names, cam_params,
-    //                               ref_to_cam_trans, depth_to_image,
-    //                               ref_to_cam_timestamp_offsets);
   }
+
   return 0;
 } // NOLINT // TODO(oalexan1): Remove this, after making the code more modular

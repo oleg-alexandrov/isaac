@@ -62,6 +62,7 @@
 
 #include <dense_map_ros_utils.h>
 #include <dense_map_utils.h>
+#include <dense_map_lua_config.h>
 
 #include <string>
 #include <map>
@@ -1340,7 +1341,7 @@ int main(int argc, char** argv) {
   std::vector<double>                   ref_to_cam_timestamp_offsets;
   Eigen::Affine3d                       navcam_to_body_trans;
   Eigen::Affine3d                       hazcam_depth_to_image_transform;
-  dense_map::readConfigFile(  // Inputs
+  dense_map::readLuaConfig(  // Inputs
     cam_names, "nav_cam_transform", "haz_cam_depth_to_image_transform",
     // Outputs
     cam_params, ref_to_cam_trans, ref_to_cam_timestamp_offsets, navcam_to_body_trans,
@@ -1524,7 +1525,7 @@ int main(int argc, char** argv) {
   ref_to_cam_timestamp_offsets[1] = navcam_to_hazcam_timestamp_offset;
   ref_to_cam_timestamp_offsets[2] =
     navcam_to_hazcam_timestamp_offset - scicam_to_hazcam_timestamp_offset;
-  dense_map::updateConfigFile(cam_names, "haz_cam_depth_to_image_transform",
+  dense_map::writeLuaConfig(cam_names, "haz_cam_depth_to_image_transform",
                               cam_params, ref_to_cam_trans,
                               ref_to_cam_timestamp_offsets,
                               hazcam_depth_to_image_transform);

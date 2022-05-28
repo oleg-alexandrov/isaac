@@ -1670,9 +1670,8 @@ This program's options are:
       Flag as outliers nav cam pixels closer than this to the
       boundary, and ignore that boundary region when texturing with
       the --out_texture_dir option. This may improve the calibration
-      accuracy, especially if switching from fisheye to radtan
-      distortion for nav_cam. See also the geometry_mapper
-      --undistorted_crop_wins option.
+      accuracy. See also the geometry_mapper --undistorted_crop_wins
+      option.
 
     --timestamp_offsets_max_change (double, default = 1.0)
       If floating the timestamp offsets, do not let them change by
@@ -1765,15 +1764,6 @@ This program's options are:
       non-reference camera poses. Use --float_sparse map to float the
       reference cameras.
 
-    --nav_cam_distortion_replacement (string, default = "")
-      Replace nav_cam's distortion coefficients with this list after
-      the initial determination of triangulated points, and then
-      continue with distortion optimization. A quoted list of five
-      values is expected, separated by spaces, as the replacement
-      distortion model will have radial and tangential
-      coefficients. Set a positive
-      --nav_cam_num_exclude_boundary_pixels.
-
     --registration (bool, false unless specified)
       If true, and registration control points for the sparse map
       exist and are specified by --hugin_file and --xyz_file,
@@ -1820,56 +1810,6 @@ This program's options are:
    --verbose (bool, false unless specified)
       Print the residuals and save the images and match files. Stereo
       Pipeline's viewer can be used for visualizing these.
-
-### Using the refiner with a radtan model for nav_cam
-
-The camera refiner supports using a radtan distortion model for
-nav_cam, that is a model with radial and and tangential distortion,
-just like for haz_cam and sci_cam, but the default nav_cam distortion
-model is fisheye. One can edit the robot config file and replace the
-fisheye model with a desired radial + tangential distortion model (4
-or 5 coefficients are needed) then run the refiner.
-
-Since it is not easy to find a good initial set of such coefficients,
-the refiner has the option of computing such a model which best fits
-the given fisheye model. For that, the refiner is started with the
-fisheye model, this model is used to set up the problem, including
-triangulating the 3D points after feature detection, then the fisheye
-model is replaced on-the-fly with desired 5 coefficients of the radtan
-model via the option --nav_cam_distortion_replacement, to which one
-can pass, for example, "0 0 0 0 0" (in principle 4 values could be
-tried, but that was resulting in a very poor fit). These coefficients
-will then be optimized while keeping the rest of the variables fixed
-(nav cam focal length and optical center, intrinsics of other cameras,
-and all the extrinsics). The new best-fit distortion model will be
-written to disk at the end, replacing the fisheye model, and from then
-on the new model can be used for further calibration experiments just
-as with the fisheye model.
-
-It may however be needed to rerun the refiner one more time, this time
-with the new distortion model read from disk, and still keep all
-intrinsics and extrinsics (including the sparse map and depth to
-image) fixed, except for the nav cam distortion, to fully tighten it.
-
-Since it is expected that fitting such a model is harder at the
-periphery, where the distortion is stronger, the camera refiner has
-the option ``--nav_cam_num_exclude_boundary_pixels`` can be used to
-restrict the nav cam view to a central region of given dimensions when
-such such optimization takes place (whether the new model type is fit
-on the fly or read from disk when already determined). If a
-satisfactory solution is found and it is desired to later use the
-geometry mapper with such a model, note its option
-``--undistorted_crop_wins``, and one should keep in mind that that the
-restricted region specified earlier may not exactly be the region to
-be used with the geometry mapper, since the former is specified in
-distorted pixels and this one in undistorted pixels.
-
-All this logic was tested and was shown to work in a satisfactory way,
-but no thorough attempt was made at validating that a radtan distortion
-model, while having more degrees of freedom, would out-perform the
-fisheye model. That is rather unlikely, since given sufficiently many
-images with good overlap, the effect of the peripheral region where
-the fisheye lens distortion may not perform perfectly may be small.
 
 ## Orthoprojecting images
 

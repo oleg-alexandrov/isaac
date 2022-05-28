@@ -93,33 +93,6 @@ void writeCloud(std::vector<float> const& points, size_t point_size, std::string
 // Return the type of an opencv matrix
 std::string matType(cv::Mat const& mat);
 
-// Read the transform from depth to given camera
-void readCameraTransform(config_reader::ConfigReader& config, std::string const transform_str,
-                         Eigen::Affine3d& transform);
-
-// Read some transforms from the robot calibration file
-void readConfigFile                                                     // NOLINT
-(// Inputs                                                              // NOLINT
- std::vector<std::string> const& cam_names,                             // NOLINT
- std::string const& nav_cam_to_body_trans_str,                          // NOLINT
- std::string const& haz_cam_depth_to_image_trans_str,                   // NOLINT
- // Outputs                                                             // NOLINT
- std::vector<camera::CameraParameters> & cam_params,                    // NOLINT
- std::vector<Eigen::Affine3d>          & nav_to_cam_trans,              // NOLINT
- std::vector<double>                   & nav_to_cam_timestamp_offset,   // NOLINT
- Eigen::Affine3d                       & nav_cam_to_body_trans,         // NOLINT
- Eigen::Affine3d                       & haz_cam_depth_to_image_trans); // NOLINT
-
-// Save some transforms from the robot calibration file. This has some very fragile
-// logic and cannot handle comments in the config file.
-void updateConfigFile                                                           // NOLINT
-(std::vector<std::string>              const& cam_names,                        // NOLINT
- std::string                           const& haz_cam_depth_to_image_trans_str, // NOLINT
- std::vector<camera::CameraParameters> const& cam_params,                       // NOLINT
- std::vector<Eigen::Affine3d>          const& nav_to_cam_trans,                 // NOLINT
- std::vector<double>                   const& nav_to_cam_timestamp_offset,      // NOLINT
- Eigen::Affine3d                       const& haz_cam_depth_to_image_trans);    // NOLINT
-
 // Given two poses aff0 and aff1, and 0 <= alpha <= 1, do linear interpolation.
 Eigen::Affine3d linearInterp(double alpha, Eigen::Affine3d const& aff0,
                                Eigen::Affine3d const& aff1);
@@ -254,6 +227,7 @@ struct ImageMessage {
   cv::Mat image;
   double timestamp;
   std::string name;
+  Eigen::Affine3d world_to_cam;
 };
 
 // Find an image at the given timestamp or right after it. We assume

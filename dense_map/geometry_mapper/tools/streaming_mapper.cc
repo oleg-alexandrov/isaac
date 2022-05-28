@@ -52,6 +52,7 @@
 
 // isaac includes
 #include <dense_map_utils.h>
+#include <dense_map_lua_config.h>
 #include <texture_processing.h>
 
 // System includes
@@ -200,7 +201,7 @@ void StreamingMapper::Initialize(ros::NodeHandle& nh) {
     Eigen::Affine3d                       hazcam_depth_to_image_transform;
     Eigen::Affine3d                       nav_cam_to_body_trans;
 
-    dense_map::readConfigFile(  // Inputs
+    dense_map::readLuaConfig(  // Inputs
       cam_names,
       "nav_cam_transform",  // this is the nav cam to body transform
       "haz_cam_depth_to_image_transform",

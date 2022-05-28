@@ -19,6 +19,7 @@
 
 #include <dense_map_ros_utils.h>
 #include <dense_map_utils.h>
+#include <dense_map_lua_config.h>
 
 #include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -91,7 +92,8 @@ int main(int argc, char** argv) {
 
   if (FLAGS_bracket_len <= 0.0) LOG(FATAL) << "Must have a positive bracket length.";
 
-  if (FLAGS_max_time_between_images <= 0.0) LOG(FATAL) << "Must use a positive value for --max_time_between_images.\n";
+  if (FLAGS_max_time_between_images <= 0.0) LOG(FATAL)
+    << "Must use a positive value for --max_time_between_images.\n";
 
   if (!boost::filesystem::exists(FLAGS_output_nav_cam_dir))
     if (!boost::filesystem::create_directories(FLAGS_output_nav_cam_dir) ||
@@ -111,7 +113,7 @@ int main(int argc, char** argv) {
   std::vector<double>                   nav_to_cam_timestamp_offset;
   Eigen::Affine3d                       nav_cam_to_body_trans;
   Eigen::Affine3d                       haz_cam_depth_to_image_transform;
-  dense_map::readConfigFile(  // Inputs
+  dense_map::readLuaConfig(  // Inputs
     cam_types, "nav_cam_transform", "haz_cam_depth_to_image_transform",
     // Outputs
     cam_params, nav_to_cam_trans, nav_to_cam_timestamp_offset, nav_cam_to_body_trans,

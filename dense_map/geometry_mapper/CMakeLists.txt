@@ -143,7 +143,9 @@ add_definitions(${PCL_DEFINITIONS})
 add_library(geometry_mapper_lib
     src/dense_map_utils.cc
     src/system_utils.cc
+    src/dense_map_lua_config.cc
     src/dense_map_ros_utils.cc
+    src/sparse_map_utils.cc
     src/TinyEXIF.cc
     src/interest_point.cc
     src/texture_processing.cc
@@ -175,10 +177,6 @@ target_link_libraries(camera_calibrator
 
 add_executable(camera_refiner tools/camera_refiner.cc)
 target_link_libraries(camera_refiner
-    geometry_mapper_lib gflags glog)
-
-add_executable(camera_refiner_old tools/camera_refiner_old.cc)
-target_link_libraries(camera_refiner_old
     geometry_mapper_lib gflags glog)
 
 add_executable(extract_pc_from_bag tools/extract_pc_from_bag.cc)
